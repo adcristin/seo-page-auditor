@@ -1,0 +1,5 @@
+.env
+report*
+__pycache__/
+samples/regression/
+
