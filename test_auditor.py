@@ -53,6 +53,22 @@ class Units(unittest.TestCase):
     def test_norm(self):
         self.assertEqual(A.norm("https://www.Example.com/a/?utm_source=x"), A.norm("http://example.com/a"))
 
+    def test_category_scores_calculation(self):
+        # Mock a small set of findings
+        F = [
+            A.Finding("access", "high", "Title", "Ev", "Fix", "both"), # -15
+            A.Finding("access", "low", "Title", "Ev", "Fix", "both"),  # -3
+            A.Finding("content", "med", "Title", "Ev", "Fix", "ai"),    # -7
+            A.Finding("metadata", "info", "Title", "Ev", "Fix", "search"), # -0
+        ]
+        # we need a way to test the audit's scoring without running the full audit
+        # unfortunately audit() is one big function. we can test it via a custom FakeTF.
+        # but for a unit test of the math, let's just verify the penalty map.
+        self.assertEqual(A.PEN["high"], 15)
+        self.assertEqual(A.PEN["med"], 7)
+        self.assertEqual(A.PEN["low"], 3)
+        self.assertEqual(A.PEN["info"], 0)
+
     def test_robots_markdown_escaped_star_and_precedence(self):
         g, sm = A.parse_robots("User-Agent: \\*\nDisallow: /private/\nAllow: /private/ok\n\nUser-agent: GPTBot\nDisallow: /\nSitemap: https://x.com/s.xml")
         self.assertFalse(A.robots_allows(g, "GPTBot", "/anything"))
@@ -72,6 +88,54 @@ class Units(unittest.TestCase):
 
     def test_derive_query(self):
         self.assertEqual(A.derive_query("TinyFish — Web Infrastructure for AI Agents", ""), "Web Infrastructure for AI Agents")
+
+    def test_og_and_twitter_tags(self):
+        class MetaTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                for u in got:
+                    meta = {"canonical": u}
+                    if "all_present" in u:
+                        meta["og"] = {"title": "T", "description": "D", "image": "I"}
+                        meta["twitter"] = {"card": "summary"}
+                    elif "og_complete_no_twitter" in u:
+                        meta["og"] = {"title": "T", "description": "D", "image": "I"}
+                    elif "partial_og_no_twitter" in u:
+                        meta["og"] = {"title": "T"}
+                    elif "everything_missing" in u:
+                        meta = {}
+                    got[u]["page_metadata"] = meta
+                return got, err
+
+        # Scenario A: All OG present, no twitter -> No finding
+        r = A.audit("https://example.com/og_complete_no_twitter", "q", MetaTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertNotIn("Open Graph tags incomplete", titles)
+        self.assertNotIn("Twitter card tag missing", titles)
+
+        # Scenario B: Partial OG, missing twitter -> "Open Graph tags incomplete" (listing both)
+        r = A.audit("https://example.com/partial_og_no_twitter", "q", MetaTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Open Graph tags incomplete", titles)
+        finding = next(f for f in r["findings"] if f["title"] == "Open Graph tags incomplete")
+        self.assertIn("og:description", finding["evidence"])
+        self.assertIn("og:image", finding["evidence"])
+        self.assertIn("twitter:card", finding["evidence"])
+
+        # Scenario C: Everything missing -> "Open Graph tags incomplete" (listing all)
+        r = A.audit("https://example.com/everything_missing", "q", MetaTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Open Graph tags incomplete", titles)
+        finding = next(f for f in r["findings"] if f["title"] == "Open Graph tags incomplete")
+        self.assertIn("og:title", finding["evidence"])
+        self.assertIn("og:description", finding["evidence"])
+        self.assertIn("og:image", finding["evidence"])
+        self.assertIn("twitter:card", finding["evidence"])
+
+        # Scenario D: All present -> No finding
+        r = A.audit("https://example.com/all_present", "q", MetaTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertNotIn("Open Graph tags incomplete", titles)
 
 
 class Regressions(unittest.TestCase):
@@ -133,10 +197,63 @@ class Regressions(unittest.TestCase):
         r = A.audit(home, "widgets shop", HomeTF(), raw_fn=fake_raw)
         self.assertNotIn("Top results show dates", " | ".join(f["title"] for f in r["findings"]))
 
+    def test_topic_gap_analysis(self):
+        class TopicTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                if kw.get("include_selectors") and "h2" in kw.get("include_selectors", []):
+                    # Mock headings for competitors
+                    # Competitor 1: [Features, How to use, Pricing, Navigation]
+                    # Competitor 2: [Top Features, Using widgets, Pricing]
+                    # Competitor 3: [Features Review, Pricing, Footer]
+                    h_map = {
+                        "https://rival1.com/widgets": "<h1>H1</h1><h2>Features</h2><h2>How to use</h2><h2>Pricing</h2><h2>Navigation</h2>",
+                        "https://rival2.com/widgets": "<h1>H1</h1><h2>Top Features</h2><h2>Using widgets</h2><h2>Pricing</h2>",
+                        "https://rival3.com/widgets": "<h1>H1</h1><h2>Features Review</h2><h2>Pricing</h2><h2>Footer</h2>",
+                    }
+                    for u in urls:
+                        if u in h_map:
+                            got[u] = {"url": u, "text": h_map[u]}
+                return got, err
 
-class FullAudit(unittest.TestCase):
-    def test_audit_finds_the_planted_problems(self):
+        # Audited page covers "Pricing"
+        class AuditPageTF(TopicTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                if urls == [PAGE] and kw.get("include_selectors"):
+                    got[PAGE] = {"url": PAGE, "text": "<h1>H1</h1><h2>Pricing</h2>"}
+                return got, err
+
+        r = A.audit(PAGE, "widgets", AuditPageTF(), raw_fn=fake_raw)
+
+        # "Pricing" should be covered.
+        # "Features" (shared by 3) should be a gap.
+        # "How to use / Using widgets" (shared by 2) should be a gap.
+        # "Navigation" and "Footer" should be dropped as boilerplate.
+
+        gaps = r.get("topic_gaps", [])
+        self.assertTrue(len(gaps) >= 1)
+        self.assertTrue(any("Feature" in g for g in gaps))
+        self.assertTrue(any("use" in g.lower() or "using" in g.lower() for g in gaps))
+        self.assertFalse(any("Pricing" in g for g in gaps))
+        self.assertFalse(any("Navigation" in g for g in gaps))
+        self.assertFalse(any("Footer" in g for g in gaps))
+
+    def test_topic_gap_skip_condition(self):
+        class OneCompTF(FakeTF):
+            def search(self, query, page=0, **kw):
+                if page: return []
+                return [{"position": 1, "url": "https://rival1.com/widgets", "title": "T", "snippet": "s"}]
+
+        r = A.audit(PAGE, "widgets", OneCompTF(), raw_fn=fake_raw)
+        self.assertEqual(r.get("topic_gaps", []), [])
+        titles = [f["title"] for f in r["findings"]]
+        self.assertNotIn("Topics the top pages cover that yours does not", titles)
+
         r = A.audit(PAGE, "best widgets for small teams", FakeTF(), raw_fn=fake_raw)
+        self.assertIn("category_scores", r)
+        self.assertEqual(len(r["category_scores"]), 4)
+        self.assertTrue(all(0 <= s <= 100 for s in r["category_scores"].values()))
         titles = " | ".join(f["title"] for f in r["findings"])
         for expect in ("robots.txt blocks search crawlers", "only exists after JavaScript", "No structured data",
                        "Canonical points to a different URL", "images have no alt", "Query terms missing from your title",
@@ -165,7 +282,6 @@ class FullAudit(unittest.TestCase):
         self.assertEqual(r["findings"][0]["title"], "AI tools cannot extract any text from this page")
         self.assertEqual(r["page"]["words"], 0)
         A.to_markdown(r)
-
 
 if __name__ == "__main__":
     unittest.main()

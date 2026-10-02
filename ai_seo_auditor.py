@@ -156,8 +156,60 @@ def key_terms(q: str) -> list[str]:
     return [t for t in tokens(q) if t not in STOP]
 
 
-def sim(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+def extract_topic_gaps(audited_page, comps_data, query_terms):
+    """Find topics present in competitors but missing from the audited page."""
+    BOILERPLATE = {"navigation", "table of contents", "related", "comments", "share", "menu", "search", "footer"}
+
+    # 1. Extract and normalize competitor H2s
+    comp_topics = [] # list of (original_text, token_set, comp_idx)
+    for idx, c in enumerate(comps_data):
+        h2s = c.get("h2_texts", [])
+        for h in h2s:
+            h_clean = clean(h)
+            if any(b in h_clean.lower() for b in BOILERPLATE):
+                continue
+            t_set = set(tokens(h_clean)) - STOP
+            if t_set:
+                comp_topics.append((h_clean, t_set, idx))
+
+    if not comp_topics:
+        return []
+
+    # 2. Merge near-duplicates and identify candidate topics
+    topics = [] # list of { "representative": str, "tokens": set, "comps": set() }
+    for text, t_set, idx in comp_topics:
+        merged = False
+        for topic in topics:
+            overlap = len(t_set & topic["tokens"]) / min(len(t_set), len(topic["tokens"])) if t_set and topic["tokens"] else 0
+            if overlap >= 0.6:
+                topic["comps"].add(idx)
+                merged = True
+                break
+        if not merged:
+            topics.append({"representative": text, "tokens": t_set, "comps": {idx}})
+
+    # 3. Filter by frequency or query terms
+    qualified = []
+    for t in topics:
+        is_common = len(t["comps"]) >= 2
+        has_query = any(q in t["tokens"] for q in query_terms)
+        if is_common or has_query:
+            qualified.append(t)
+
+    # 4. Remove topics covered by audited page
+    audit_md = audited_page.get("text") or ""
+    audit_excerpt = " ".join(tokens(audit_md[:2000]))
+    audit_heads = " ".join([t for l, t in audited_page.get("dom_heads", []) if l in (2, 3)])
+    audit_coverage_text = (audit_excerpt + " " + audit_heads).lower()
+
+    gaps = []
+    for t in qualified:
+        hits = sum(1 for tok in t["tokens"] if tok in audit_coverage_text)
+        if hits < len(t["tokens"]) * 0.7:
+            gaps.append(t)
+
+    return [g["representative"] for g in gaps[:6]]
+
 
 
 def count_words(md: str) -> int:
@@ -382,6 +434,12 @@ def snippet_source(snip: str, desc: str, body: str) -> str:
     return "page body" if ov(body) >= 0.7 else "unknown"
 
 
+def sim(s1: str, s2: str) -> float:
+    """Token-set overlap: intersection / min(len)."""
+    t1, t2 = set(tokens(s1)), set(tokens(s2))
+    return len(t1 & t2) / min(len(t1), len(t2)) if t1 and t2 else 0.0
+
+
 def title_rewritten(serp_title: str, title: str, h1: str) -> bool:
     s = re.sub(r"[.…\s]+$", "", serp_title or "").lower()
     cands = [c.lower() for c in (title, h1) if c]
@@ -602,7 +660,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             comps.append(pr)
             kept.append(r["url"])
     if comps:
-        hg, _ = tf.fetch(kept, format="html", include_selectors=["h1"], links=False, image_links=False, page_metadata=False)
+        hg, _ = tf.fetch(kept, format="html", include_selectors=["h1", "h2"], links=False, image_links=False, page_metadata=False)
         for c in comps:
             src = next((v for k, v in hg.items() if norm(k) == norm(c["url"]) or norm(v.get("final_url") or "") == norm(c["url"])), None)
             if src:
@@ -610,6 +668,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 o.feed(src.get("text") or "")
                 c["h1"] = best_h1(o.headings, c["title"], c["h1"])
                 c["t_h1"] = term_hits(terms, c["h1"])
+                c["h2_texts"] = [t for l, t in o.headings if l == 2]
+
 
     # =========================================================== findings
     # -- access
@@ -720,9 +780,23 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         elif not 70 <= len(desc) <= 160:
             add("metadata", "low", "Meta description length", f"{len(desc)} chars.", "Aim for 120-160 characters.", "search")
         og = meta.get("og") or {}
-        miss = [k for k in ("title", "description", "image") if not og.get(k)]
-        if miss:
-            add("metadata", "low", "Open Graph tags incomplete", f"Missing og:{', og:'.join(miss)}.", "Add the missing og: tags; link previews and many AI tools use them.", "both")
+        og_miss = [k for k in ("title", "description", "image") if not og.get(k)]
+        twitter_card = (meta.get("twitter") or {}).get("card")
+
+        if og_miss:
+            # OG is incomplete, list missing OG tags and also twitter:card if missing
+            miss_list = [f"og:{k}" for k in og_miss]
+            if not twitter_card:
+                miss_list.append("twitter:card")
+
+            add("metadata", "low", "Open Graph tags incomplete",
+                f"Missing {', '.join(miss_list)}.",
+                "Add the missing og: tags; link previews and many AI tools use them.", "both")
+        elif not twitter_card:
+            # OG is complete, but twitter:card is missing.
+            # The user said: "Treat twitter:card missing as a gap only if og:title/og:description/og:image are not all present"
+            # This means if OG is complete, twitter:card missing is NOT a finding.
+            pass
         if not meta.get("viewport"):
             add("metadata", "low", "No viewport meta tag", "", 'Add <meta name="viewport" content="width=device-width, initial-scale=1">.', "search", "Mobile-first indexing.")
         if not page.get("language"):
@@ -760,8 +834,25 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 add("visibility", sev, f"Query terms missing from your {label}", f"Missing: {', '.join(miss)}. Top results cover {round(theirs * 100)}% of the terms there; you cover {round(mine * 100)}%.",
                     f"Work {', '.join(miss)} into the {label} where it reads naturally.", "search",
                     "Extractors weigh title/H1/opening text most when deciding what a page answers.")
+
+        # Topic Gap Analysis
+        if len(comps) >= 2:
+            gaps = extract_topic_gaps({"text": md, "dom_heads": dom_heads}, comps, terms)
+            if gaps:
+                sev = "med" if len(gaps) >= 3 else "low"
+                counts = []
+                for g in gaps:
+                    count = sum(1 for c in comps if any(sim(g, h) >= 0.6 for h in c.get("h2_texts", [])))
+                    counts.append(f"{g} (covered by {count} of {len(comps)})")
+
+                add("visibility", sev, "Topics the top pages cover that yours does not",
+                    f"Topics missing: {', '.join(counts)}.",
+                    "Add sections covering these topics only where they genuinely apply to your content.", "search")
+                me["topic_gaps"] = gaps
+
         mw = median([c["words"] for c in comps])
         if mw and me["words"] < 0.5 * mw:
+
             add("visibility", "med", "Much thinner than the pages that outrank you", f"You: {me['words']} words. Median of top results: {mw}.",
                 "Cover the sub-questions those pages answer (see their H2s). Length itself is not the goal; coverage is.", "search")
         if comps and sum(1 for c in comps if c["tables"] or c["lists"]) >= 2 and not (me["tables"] or me["lists"]):
@@ -772,6 +863,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             add("visibility", "med", "Top results show dates; your page exposes none", f"{dated} of the top 5 results carry a date in search.", "Expose a visible publish/updated date and mirror it in JSON-LD.", "search")
 
     # =========================================================== scores (transparent heuristics)
+    # Per-category breakdown
+    cat_scores = {}
+    for area in ["access", "content", "metadata", "visibility"]:
+        penalty_sum = sum(PEN[f.sev] for f in F if f.area == area)
+        cat_scores[area] = max(0, 100 - penalty_sum)
+
     ai = max(0, 100 - sum(PEN[f.sev] for f in F if f.affects in ("ai", "both")))
     base = 10 if rank is None else 95 if rank <= 3 else max(50, 80 - 3 * (rank - 4)) if rank <= 10 else 40
     vis = max(0, base - sum(PEN[f.sev] for f in F if f.affects == "search") // 2)
@@ -790,6 +887,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                  "jsonld_types": ld_summary(raw["jsonld"])[0] if raw else None, "raw_status": (raw or {}).get("status")},
         "site": {"robots_txt": bool(robots_txt), "llms_txt": bool(llms_txt), "in_sitemap": sm_found, "blocked_bots": [b for b, v in blocked.items() if v]},
         "competitors": comps, "competitor_errors": comp_err, "findings": [asdict(f) for f in F], "fix_first": fix_first_titles, "calls": tf.calls,
+        "category_scores": cat_scores, "topic_gaps": me.get("topic_gaps", []),
     }
 
 
@@ -810,7 +908,11 @@ def to_markdown(r: dict) -> str:
          "## Verdict\n", f"- **AI readability:** {S['ai_readability']}/100", f"- **Search visibility for the query:** {rank} (score {S['search_visibility']}/100)",
          f"- **Findings:** {sum(f['sev'] == 'high' for f in r['findings'])} high, {sum(f['sev'] == 'med' for f in r['findings'])} medium, "
          f"{sum(f['sev'] == 'low' for f in r['findings'])} low\n",
-         "_Scores are transparent heuristics: readability = 100 minus finding penalties (high 15, medium 7, low 3); visibility starts from rank and is reduced by search-side findings._\n",
+         "| Category | Score | Findings |\n|---|---|---|\n" + "\n".join(
+             f"| {area} | {s} | {sum(1 for f in r['findings'] if f['area'] == area)} |"
+             for area, s in r.get("category_scores", {}).items()
+         ) + "\n",
+         "_Scores are transparent heuristics: readability = 100 minus finding penalties (high 15, medium 7, low 3); visibility starts from rank and is reduced by search-side findings. Category scores use the same penalties._\n",
          "## Fix first\n"]
 
     # Fix First Section logic
