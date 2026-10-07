@@ -2,7 +2,9 @@
 They check the analysis logic and report wiring only; they are not a demo. Live check: run the CLI."""
 import unittest
 import os
+from unittest import mock
 import ai_seo_auditor as A
+import requests
 
 PAGE = "https://shop.example.com/blog/best-widgets/"
 BODY = ("# Our Guide\n\n" + " ".join(f"Sentence number {i} talks about widgets and teams in ordinary words today." for i in range(40))
@@ -10,6 +12,67 @@ BODY = ("# Our Guide\n\n" + " ".join(f"Sentence number {i} talks about widgets a
 COMP_BODY = ("# Best widgets for small teams\n\n" + " ".join("Small teams need widgets that ship fast." for _ in range(90))
              + "\n\n## Comparison\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n## What is a widget?\n\n- one\n- two\n")
 
+PAGE = "https://shop.example.com/blog/best-widgets/"
+BODY = ("# Our Guide\n\n" + " ".join(f"Sentence number {i} talks about widgets and teams in ordinary words today." for i in range(40))
+        + "\n\n## Pricing\n\nSome text here.\n\n#### Skipped level\n\nMore text.\n")
+COMP_BODY = ("# Best widgets for small teams\n\n" + " ".join("Small teams need widgets that ship fast." for _ in range(90))
+             + "\n\n## Comparison\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n## What is a widget?\n\n- one\n- two\n")
+
+
+class FaultyTF:
+    def __init__(self, timeout=30, max_retries=3):
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.calls = []
+        self.fail_count = 0
+        self.fail_until = 0
+        self.persistent_fail = False
+        self.fail_type = None
+
+    def set_transient_fail(self, count, fail_type):
+        self.fail_until = count
+        self.fail_type = fail_type
+
+    def set_persistent_fail(self, fail_type):
+        self.persistent_fail = True
+        self.fail_type = fail_type
+
+    def _handle_call(self, call_type, *args, **kwargs):
+        self.calls.append((call_type, args[0] if args else ""))
+        if self.persistent_fail:
+            self._raise_fail()
+        if self.fail_count < self.fail_until:
+            self.fail_count += 1
+            self._raise_fail()
+        return None
+
+    def _raise_fail(self):
+        if self.fail_type == "timeout":
+            raise requests.Timeout("Request timed out")
+        if self.fail_type == "connection":
+            raise requests.ConnectionError("Connection refused")
+        if self.fail_type == "429":
+            r = requests.Response()
+            r.status_code = 429
+            r.headers["Retry-After"] = "0.1"
+            raise requests.HTTPError("Too Many Requests", response=r)
+        raise Exception("Unknown failure")
+
+    def search(self, query, page=0, **kw):
+        self._handle_call("search", query)
+        return [{"position": 1, "url": PAGE, "title": "T", "snippet": "s"}]
+
+    def fetch(self, urls, **kw):
+        self._handle_call("fetch", urls[0])
+        got, err = {}, {}
+        for u in urls:
+            if u == PAGE:
+                got[u] = {"url": u, "final_url": PAGE, "title": "Our Guide", "text": BODY, "language": "en",
+                          "links": [], "published_date": None, "author": None,
+                          "page_metadata": {"canonical": PAGE, "og": {"type": "article"}}}
+            else:
+                got[u] = {"url": u, "final_url": u, "title": "Comp", "text": COMP_BODY, "published_date": "2026-08-01"}
+        return got, err
 
 class FakeTF:
     calls = []
@@ -53,6 +116,37 @@ class Units(unittest.TestCase):
     def test_norm(self):
         self.assertEqual(A.norm("https://www.Example.com/a/?utm_source=x"), A.norm("http://example.com/a"))
 
+    def test_raw_view_non_html(self):
+        """Verify raw_view identifies non-HTML content and skips parsing."""
+        with mock.patch("requests.get") as m:
+            # Mock a PDF response
+            mock_res = mock.Mock()
+            mock_res.status_code = 200
+            mock_res.headers = {"Content-Type": "application/pdf"}
+            mock_res.iter_content.return_value = [b"PDF data"]
+            m.return_value = mock_res
+
+            res = A.raw_view("https://example.com/doc.pdf")
+            self.assertTrue(res["non_html"])
+            self.assertEqual(res["content_type"], "application/pdf")
+            self.assertEqual(res["text"], "")
+
+    def test_raw_view_truncation(self):
+        """Verify raw_view caps body size."""
+        with mock.patch("requests.get") as m:
+            mock_res = mock.Mock()
+            mock_res.status_code = 200
+            mock_res.headers = {"Content-Type": "text/html"}
+            # Return chunks that exceed 3MB
+            mock_res.iter_content.return_value = [b"a" * 1024 * 1024] * 4
+            m.return_value = mock_res
+
+            res = A.raw_view("https://example.com/huge.html")
+            self.assertFalse(res["non_html"])
+            self.assertTrue(res["truncated"])
+            # Check that it was capped at 3MB (approx)
+            self.assertLessEqual(len(res["text"]), 3 * 1024 * 1024)
+
     def test_category_scores_calculation(self):
         # Mock a small set of findings
         F = [
@@ -88,6 +182,42 @@ class Units(unittest.TestCase):
 
     def test_derive_query(self):
         self.assertEqual(A.derive_query("TinyFish — Web Infrastructure for AI Agents", ""), "Web Infrastructure for AI Agents")
+
+    def test_error_handling_graceful_degradation(self):
+        """Test that the audit continues when Search or Competitors fail."""
+        # Mock search to fail persistently
+        class SearchFailTF(FakeTF):
+            def search(self, query, page=0, **kw):
+                raise requests.Timeout("Search timed out")
+            def fetch(self, urls, **kw):
+                return super().fetch(urls, **kw)
+
+        r = A.audit(PAGE, "best widgets", SearchFailTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Search unavailable, visibility not measured", titles)
+        self.assertEqual(r["rank"], None)
+        self.assertTrue(len(r["findings"]) > 0)
+
+    def test_critical_fetch_failure(self):
+        """Test that a failure to fetch the main page returns an error status."""
+        tf = FaultyTF()
+        tf.set_persistent_fail("connection")
+
+        r = A.audit(PAGE, "best widgets", tf, raw_fn=fake_raw)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["findings"][0]["title"], "Main page could not be fetched")
+
+    def test_competitor_fetch_failure(self):
+        """Test that competitor fetch failures are logged but don't crash the audit."""
+        class CompFailTF(FakeTF):
+            def fetch(self, urls, **kw):
+                if any("rival" in u for u in urls):
+                    raise requests.ConnectionError("Competitor site down")
+                return super().fetch(urls, **kw)
+
+        r = A.audit(PAGE, "best widgets", CompFailTF(), raw_fn=fake_raw)
+        self.assertEqual(len(r["competitors"]), 0)
+        self.assertTrue(any("Competitor fetch failed" in e[2] for e in r["competitor_errors"]))
 
     def test_og_and_twitter_tags(self):
         class MetaTF(FakeTF):
@@ -138,12 +268,61 @@ class Units(unittest.TestCase):
         self.assertNotIn("Open Graph tags incomplete", titles)
 
 
-class Regressions(unittest.TestCase):
-    """Bugs found by running the tool on real pages."""
+    def test_audit_non_html_handling(self):
+        """Verify audit() handles non-HTML pages by adding a low-sev finding and skipping HTML checks."""
+        class NonHtmlTF(FakeTF):
+            def fetch(self, urls, **kw):
+                # Return some extracted text (e.g. from a PDF) so profiling still happens
+                got = {PAGE: {"url": PAGE, "final_url": PAGE, "text": "This is a PDF with words.", "title": "PDF Title"}}
+                return got, {}
+
+        def fake_raw_pdf(url):
+            return {"status": 200, "non_html": True, "content_type": "application/pdf", "size": 1000, "text": "", "x_robots": ""}
+
+        r = A.audit(PAGE, "pdf query", NonHtmlTF(), raw_fn=fake_raw_pdf)
+
+        # Should have "Not an HTML page" finding
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Not an HTML page", titles)
+
+        # Should NOT have HTML-only findings like JSON-LD or JS-dependence
+        self.assertNotIn("No structured data (JSON-LD)", titles)
+        self.assertNotIn("Much of the text only exists after JavaScript runs", titles)
+
+        # Profiling should still have worked (words extracted)
+        self.assertGreater(r["page"]["words"], 0)
 
     def test_acronym_matches_expansion(self):  # Wikipedia: query "seo" vs title "Search engine optimization"
         self.assertEqual(A.term_hits(["seo"], "Search engine optimization - Wikipedia"), 1)
         self.assertEqual(A.term_hits(["seo"], "Welcome to our shop"), 0)
+
+    def test_unicode_tokenization(self):
+        # Hindi - Simplified check: just ensure we get tokens
+        self.assertTrue(len(A.tokens("नमस्ते दुनिया")) > 0)
+        # Cyrillic
+        self.assertTrue(len(A.tokens("Привет мир")) > 0)
+        # Mixed
+        self.assertTrue(len(A.tokens("Hello नमस्ते")) > 0)
+
+    def test_cjk_fallback(self):
+        # Japanese text
+        text = "これはテストページです" # "This is a test page"
+        self.assertTrue(A.is_cjk(text))
+        # "テスト" (test) should be matched as a bigram sequence
+        self.assertGreater(A.term_hits(["テスト"], text), 0)
+
+    def test_zero_term_query(self):
+        class EmojiTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got = {PAGE: {"url": PAGE, "final_url": PAGE, "text": "Some text", "title": "T"}}
+                return got, {}
+
+        r = A.audit(PAGE, "🚀🔥", EmojiTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Query terms could not be analysed", titles)
+
+    def test_acronym_still_works(self):
+        self.assertEqual(A.term_hits(["seo"], "Search engine optimization"), 1)
 
     def test_clean_nbsp(self):
         self.assertEqual(A.clean("use the\u00a0web. "), "use the web.")

@@ -17,8 +17,11 @@ import datetime as dt
 import difflib
 import json
 import os
+import random
 import re
 import sys
+import time
+import ipaddress
 from dataclasses import dataclass, asdict
 from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qsl, urlencode
@@ -28,6 +31,10 @@ import requests
 SEARCH_URL = "https://api.search.tinyfish.ai"
 FETCH_URL = "https://api.fetch.tinyfish.ai"
 UA = "Mozilla/5.0 (compatible; ai-seo-auditor/0.1)"
+
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0
+RETRY_JITTER_RANGE = (0.1, 0.5)
 
 # bot token -> what blocking it costs you. Verify against vendor docs; this list drifts.
 BOTS = {
@@ -45,21 +52,56 @@ PEN = {"high": 15, "med": 7, "low": 3, "info": 0}
 class TinyFish:
     """Thin REST wrapper. Logs every call so the report can show its own provenance."""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, timeout: int = 30, max_retries: int = RETRY_MAX_ATTEMPTS):
         self.s = requests.Session()
         self.s.headers["X-API-Key"] = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.calls: list[tuple[str, str]] = []
 
+    def _get_retry_after(self, r: requests.Response) -> float | None:
+        after = r.headers.get("Retry-After")
+        if not after:
+            return None
+        try:
+            return float(after)
+        except ValueError:
+            # It could be an HTTP date; for simplicity in this CLI, we skip date parsing
+            # and fall back to exponential backoff.
+            return None
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        last_ex = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                r = self.s.request(method, url, **kwargs)
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    if attempt == self.max_retries:
+                        r.raise_for_status()
+
+                    delay = self._get_retry_after(r) or (RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                    delay += random.uniform(*RETRY_JITTER_RANGE)
+                    time.sleep(delay)
+                    continue
+
+                r.raise_for_status()
+                return r
+            except (requests.Timeout, requests.ConnectionError) as ex:
+                last_ex = ex
+                if attempt == self.max_retries:
+                    raise
+                delay = (RETRY_BASE_DELAY * (2 ** (attempt - 1))) + random.uniform(*RETRY_JITTER_RANGE)
+                time.sleep(delay)
+        raise last_ex
+
     def search(self, query: str, **params) -> list[dict]:
-        r = self.s.get(SEARCH_URL, params={"query": query, **params}, timeout=30)
-        r.raise_for_status()
+        r = self._request_with_retry("GET", SEARCH_URL, params={"query": query, **params}, timeout=self.timeout)
         self.calls.append(("search", f"{query} (page {params.get('page', 0)})"))
         return r.json().get("results", [])
 
     def fetch(self, urls: list[str], **body) -> tuple[dict, dict]:
         payload = {"urls": urls, "format": "markdown", "ttl": 0, **body}  # ttl=0 -> live, not cached
-        r = self.s.post(FETCH_URL, json=payload, timeout=150)
-        r.raise_for_status()
+        r = self._request_with_retry("POST", FETCH_URL, json=payload, timeout=self.timeout)
         data = r.json()
         self.calls.append(("fetch", f"{payload['format']} " + ", ".join(urls)))
         return ({x["url"]: x for x in data.get("results", [])},
@@ -88,7 +130,7 @@ def norm(u: str) -> str:
 
 
 def tokens(s: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", (s or "").lower())
+    return re.findall(r"\w+", (s or "").casefold(), re.UNICODE)
 
 
 def clean(s) -> str:
@@ -143,22 +185,73 @@ def decode_body(r) -> str:
         return r.content.decode("cp1252", errors="replace")
 
 
+def decode_body_bytes(content: bytes, content_type: str = "") -> str:
+    """Decodes raw bytes using the same logic as decode_body, but for pre-fetched bytes."""
+    if re.search(r"charset=", content_type, re.I):
+        # Requests' .text uses r.encoding. Since we don't have the response object here,
+        # we'll try utf-8 first, then fallback.
+        pass
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content.decode("cp1252", errors="replace")
+
+
+def is_cjk(s: str) -> bool:
+    """Heuristic: check if there's a significant presence of CJK characters."""
+    if not s:
+        return False
+    cjk_count = sum(1 for c in s if '一' <= c <= '鿿' or '぀' <= c <= 'ヿ' or '가' <= c <= '힯')
+    return cjk_count / len(s) > 0.1
+
+def get_terms(s: str, use_bigrams: bool = False) -> set[str]:
+    """Returns a set of terms. If use_bigrams is True (for CJK), returns character bigrams."""
+    if not s:
+        return set()
+    if not use_bigrams:
+        return set(tokens(s))
+    # CJK bigram fallback
+    text = s.casefold()
+    return {text[i:i+2] for i in range(len(text) - 1)}
+
 def term_hits(terms: list[str], text: str):
     """Share of query terms present in text. 'seo' also matches 'Search Engine Optimization'."""
     if not terms:
         return None
     t = clean(text).lower()
-    initials = "".join(w[0] for w in tokens(t))
-    return sum(1 for x in terms if x in t or (3 <= len(x) <= 6 and x in initials)) / len(terms)
+    # Use bigrams for both if the text is CJK
+    cjk = is_cjk(t)
+    search_text = t if not cjk else t.casefold()
+
+    # For CJK, we check if the term (which might be a bigram) is in the text
+    # For English, we keep the acronym logic.
+    hits = 0
+    for x in terms:
+        if x in search_text:
+            hits += 1
+        elif not cjk and (3 <= len(x) <= 6):
+            # Acronym logic: 'seo' matches 'S... E... O...'
+            initials = "".join(w[0] for w in tokens(t))
+            if x in initials:
+                hits += 1
+    return hits / len(terms)
 
 
 def key_terms(q: str) -> list[str]:
-    return [t for t in tokens(q) if t not in STOP]
+    t = tokens(q)
+    # Only apply English stopword removal if the tokens look like English (ASCII)
+    if t and all(ord(c) < 128 for tok in t for c in tok):
+        return [tok for tok in t if tok not in STOP]
+    return t
 
 
 def extract_topic_gaps(audited_page, comps_data, query_terms):
     """Find topics present in competitors but missing from the audited page."""
     BOILERPLATE = {"navigation", "table of contents", "related", "comments", "share", "menu", "search", "footer"}
+
+    # Detect CJK for the whole analysis
+    audit_md = audited_page.get("text") or ""
+    cjk = is_cjk(audit_md)
 
     # 1. Extract and normalize competitor H2s
     comp_topics = [] # list of (original_text, token_set, comp_idx)
@@ -168,7 +261,8 @@ def extract_topic_gaps(audited_page, comps_data, query_terms):
             h_clean = clean(h)
             if any(b in h_clean.lower() for b in BOILERPLATE):
                 continue
-            t_set = set(tokens(h_clean)) - STOP
+            # Use bigrams for CJK
+            t_set = get_terms(h_clean, use_bigrams=cjk) - (set(STOP) if not cjk else set())
             if t_set:
                 comp_topics.append((h_clean, t_set, idx))
 
@@ -197,7 +291,6 @@ def extract_topic_gaps(audited_page, comps_data, query_terms):
             qualified.append(t)
 
     # 4. Remove topics covered by audited page
-    audit_md = audited_page.get("text") or ""
     audit_excerpt = " ".join(tokens(audit_md[:2000]))
     audit_heads = " ".join([t for l, t in audited_page.get("dom_heads", []) if l in (2, 3)])
     audit_coverage_text = (audit_excerpt + " " + audit_heads).lower()
@@ -373,11 +466,45 @@ class RawPage(HTMLParser):
 def raw_view(url: str) -> dict:
     """Plain HTTP GET. Not a TinyFish call: Fetch renders JS and hides <script> tags, so this is
     the only way to see JSON-LD and to measure how much text depends on JavaScript."""
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=25, stream=True)
+
+    content_type = r.headers.get("Content-Type", "").lower()
+    is_html = "text/html" in content_type or "application/xhtml+xml" in content_type
+
+    # Cap body read to 3MB
+    MAX_BODY = 3 * 1024 * 1024
+    body_bytes = b""
+    truncated = False
+    for chunk in r.iter_content(chunk_size=8192):
+        body_bytes += chunk
+        if len(body_bytes) >= MAX_BODY:
+            body_bytes = body_bytes[:MAX_BODY]
+            truncated = True
+            break
+
+    if not is_html:
+        return {
+            "status": r.status_code,
+            "x_robots": r.headers.get("X-Robots-Tag", ""),
+            "non_html": True,
+            "content_type": content_type,
+            "size": len(body_bytes),
+            "text": ""
+        }
+
     p = RawPage()
-    p.feed(decode_body(r))
-    return {"status": r.status_code, "x_robots": r.headers.get("X-Robots-Tag", ""), "title": p.title.strip(),
-            "meta": p.meta, "jsonld": p.jsonld, "text": " ".join(p.text)}
+    p.feed(decode_body_bytes(body_bytes))
+
+    return {
+        "status": r.status_code,
+        "x_robots": r.headers.get("X-Robots-Tag", ""),
+        "title": p.title.strip(),
+        "meta": p.meta,
+        "jsonld": p.jsonld,
+        "text": " ".join(p.text),
+        "non_html": False,
+        "truncated": truncated
+    }
 
 
 def ld_summary(blocks: list[str]):
@@ -515,7 +642,16 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
 
     # ---- FETCH 1: the page as an AI tool extracts it (rendered, live)
-    got, errs = tf.fetch([url], links=True, image_links=True, page_metadata=True)
+    try:
+        got, errs = tf.fetch([url], links=True, image_links=True, page_metadata=True)
+    except (requests.RequestException, Exception) as ex:
+        f_crit = Finding("access", "high", "Main page could not be fetched",
+                         f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
+                         "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
+                         "The primary page content is unavailable, making a full audit impossible.")
+        return {"status": "error", "url": url, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
+
     page = next(iter(got.values()), None)
     e0 = next(iter(errs.values()), {})
     if page is None and (e0.get("status") in (404, 410) or e0.get("error") == "page_not_found"):
@@ -573,14 +709,23 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         except Exception as ex:  # noqa: BLE001
             raw_err = str(ex)
 
-    desc_src = "raw HTML" if raw else "TinyFish Fetch"
-    desc = raw["meta"].get("description", "") if raw else (page.get("description") or "")
+    is_html_raw = raw and not raw.get("non_html")
+    desc_src = "raw HTML" if raw and is_html_raw else "TinyFish Fetch"
+    desc = raw["meta"].get("description", "") if (raw and is_html_raw) else (page.get("description") or "")
+
+    if raw and not raw.get("non_html") and raw.get("truncated"):
+        add("content", "info", "Page content truncated", f"The page exceeds 3MB and was truncated for analysis.", "No action needed unless critical content is only found at the very bottom of a huge page.", "ai")
 
     # ---- query: given, or derived from the page itself
     query_src = "given"
     if not query:
         query, query_src = derive_query(title, h1), "derived from the page's own H1/title (tests findability by name only; pass -q for a real keyword test)"
     terms = key_terms(query)
+    if not terms:
+        add("content", "low", "Query terms could not be analysed",
+            "The provided query contains no recognisable words (e.g. it is composed only of symbols or emojis).",
+            "Provide a more descriptive query containing alphanumeric characters.", "search")
+
     me = profile(page, terms)
     me["h1"], me["t_h1"] = h1, term_hits(terms, h1)
 
@@ -625,19 +770,34 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
     # ---- SEARCH: does the page surface for the query?
     serp, rank, entry = [], None, None
-    for pg in range(3):
-        batch = tf.search(query, page=pg, **({"location": country} if country else {}))
-        serp += batch
-        for i, r in enumerate(batch, 1):
-            if norm(r["url"]) in keys:
-                rank, entry = pg * len(batch) + i, r
+    try:
+        for pg in range(3):
+            batch = tf.search(query, page=pg, **({"location": country} if country else {}))
+            serp += batch
+            for i, r in enumerate(batch, 1):
+                if norm(r["url"]) in keys:
+                    rank, entry = pg * len(batch) + i, r
+                    break
+            if rank or not batch:
                 break
-        if rank or not batch:
-            break
+    except (requests.RequestException, Exception) as ex:
+        add("visibility", "low", "Search unavailable, visibility not measured",
+            f"The TinyFish Search API returned a persistent error: {str(ex).splitlines()[0]}.",
+            "No action needed; re-run the audit later.", "search")
+
+    # Note in report if CJK fallback was used
+    if is_cjk(md):
+        add("content", "info", "CJK matching fallback active",
+            "This page appears to use a script without spaces (CJK). The auditor has switched to character bigram matching for terms and topic gaps.",
+            "No action needed.", "ai")
+
     own, own_entry = [], None
     if rank is None:  # diagnostic: is it indexed at all, if we restrict to its own domain?
-        own = tf.search(f"site:{host} {' '.join(tokens(h1 or title)[:8])}")
-        own_entry = next((r for r in own if norm(r["url"]) in keys), None)
+        try:
+            own = tf.search(f"site:{host} {' '.join(tokens(h1 or title)[:8])}")
+            own_entry = next((r for r in own if norm(r["url"]) in keys), None)
+        except (requests.RequestException, Exception):
+            pass
     seen = entry or own_entry
     if seen:
         seen = {**seen, "title": clean(seen.get("title")), "snippet": tidy_snippet(seen.get("snippet"))}
@@ -646,7 +806,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     cand = [(i, r) for i, r in enumerate(serp, 1) if norm(r["url"]).split("/")[0] != norm(url).split("/")[0]][:6]
     comps, comp_err, kept = [], [], []
     if cand:
-        cg, ce = tf.fetch([r["url"] for _, r in cand], links=False, image_links=False, page_metadata=False)
+        try:
+            cg, ce = tf.fetch([r["url"] for _, r in cand], links=False, image_links=False, page_metadata=False)
+        except (requests.RequestException, Exception) as ex:
+            comp_err.append((0, "batch", f"Competitor fetch failed: {str(ex).splitlines()[0]}"))
+            cg, ce = {}, {}
+
         for i, r in cand:
             if len(comps) >= 3:
                 break
@@ -722,7 +887,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         if me["words"] < 150:
             add("content", "high", f"Only {me['words']} words extracted", "Fetch rendered the page in a real browser and still found almost no text.",
                 "Put the substantive answer in HTML text, not images/canvas/widgets.", "both", "Little extractable text means little for an engine to match against a query.")
-        if raw:
+    if readable:
+        if me["words"] < 150:
+            add("content", "high", f"Only {me['words']} words extracted", "Fetch rendered the page in a real browser and still found almost no text.",
+                "Put the substantive answer in HTML text, not images/canvas/widgets.", "both", "Little extractable text means little for an engine to match against a query.")
+
+        if raw and not raw.get("non_html"):
             cov, miss = coverage(md, raw["text"])
             if cov is not None and cov < 0.85:
                 sev = "high" if cov < 0.5 else "med"
@@ -741,8 +911,11 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                     add("content", "med", "Invalid JSON-LD", f"{bad} block(s) fail to parse.", "Validate with a JSON linter and Google's Rich Results Test.", "both")
                 for t, m in gaps:
                     add("content", "low", f"{t} JSON-LD is missing properties", f"Missing: {', '.join(m)}.", f"Add {', '.join(m)} to the {t} object.", "both")
+        elif raw and raw.get("non_html"):
+            add("access", "low", "Not an HTML page", f"Content-Type is {raw['content_type']}.", "No action needed if this is intentional (e.g. PDF). If this should be a web page, check your server configuration.", "both")
         elif raw_err:
             add("content", "info", "Raw HTML check skipped", raw_err, "Re-run with network access to the page.", "ai")
+        heads = dom_heads or md_stats(md)[0]
         heads = dom_heads or md_stats(md)[0]
         h1s = [t for l, t in heads if l == 1]
         if not h1s:
@@ -884,7 +1057,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         "page": {**me, "title": title, "description": desc, "description_source": desc_src, "canonical": meta.get("canonical"),
                  "robots": tags.strip(), "images": len(images), "images_missing_alt": len([i for i in images if i["alt"] is None and not i["decorative"]]),
                  "links": len(set(page.get("links") or [])), "excerpt": md[:500],
-                 "jsonld_types": ld_summary(raw["jsonld"])[0] if raw else None, "raw_status": (raw or {}).get("status")},
+                 "jsonld_types": ld_summary(raw["jsonld"])[0] if (raw and not raw.get("non_html")) else None, "raw_status": (raw or {}).get("status")},
         "site": {"robots_txt": bool(robots_txt), "llms_txt": bool(llms_txt), "in_sitemap": sm_found, "blocked_bots": [b for b, v in blocked.items() if v]},
         "competitors": comps, "competitor_errors": comp_err, "findings": [asdict(f) for f in F], "fix_first": fix_first_titles, "calls": tf.calls,
         "category_scores": cat_scores, "topic_gaps": me.get("topic_gaps", []),
@@ -992,6 +1165,8 @@ def main():
     ap.add_argument("-o", "--out", default="report", help="output prefix -> <out>.md and <out>.json")
     ap.add_argument("--country", help="country code for geo-targeted search, e.g. IN, US")
     ap.add_argument("--no-raw", action="store_true", help="skip the plain HTTP GET (no JSON-LD / JS-dependence checks)")
+    ap.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
+    ap.add_argument("--retries", type=int, default=RETRY_MAX_ATTEMPTS, help="Max retry attempts for API calls")
     a = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1004,15 +1179,20 @@ def main():
         sys.exit("Set TINYFISH_API_KEY (free at agent.tinyfish.ai/api-keys).")
     url = a.url if re.match(r"https?://", a.url) else "https://" + a.url
     try:
-        res = audit(url, a.query, TinyFish(key), do_raw=not a.no_raw, country=a.country)
-    except requests.HTTPError as ex:
-        sys.exit(f"TinyFish API error {ex.response.status_code}: {ex.response.text[:300]}")
+        res = audit(url, a.query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country)
+    except (requests.RequestException, Exception) as ex:
+        sys.stderr.write(f"Error: {str(ex).splitlines()[0]} (Exit code 2)\n")
+        sys.exit(2)
     with open(a.out + ".md", "w", encoding="utf-8") as f:
         f.write(to_markdown(res))
     with open(a.out + ".json", "w", encoding="utf-8") as f:
         json.dump(res, f, indent=2, default=str)
     if res.get("status") == "not_found":
         print(f"NOT AUDITABLE: {res['findings'][0]['title']} - {res['url']}")
+        print(f"wrote {a.out}.md and {a.out}.json")
+        return
+    if res.get("status") == "error":
+        print(f"AUDIT ERROR: {res['findings'][0]['title']} - {res['url']}")
         print(f"wrote {a.out}.md and {a.out}.json")
         return
     s = res["scores"]
