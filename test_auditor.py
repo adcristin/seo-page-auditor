@@ -462,5 +462,150 @@ class Units(unittest.TestCase):
         self.assertEqual(r["page"]["words"], 0)
         A.to_markdown(r)
 
+    def test_normalize_cleaning_and_schemes(self):
+        # Whitespace
+        url, note = A.normalize_target("  https://example.com/a  ")
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        # Surrounding quotes
+        url, note = A.normalize_target('"https://example.com/a"')
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        url, note = A.normalize_target("'https://example.com/a'")
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        # Brackets
+        url, note = A.normalize_target("<https://example.com/a>")
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        # Mixed quotes and whitespace
+        url, note = A.normalize_target("  <'https://example.com/a'>  ")
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        # Fragments
+        url, note = A.normalize_target("https://example.com/a#section")
+        self.assertEqual(url, "https://example.com/a")
+        self.assertEqual(note, "Interpreted as https://example.com/a")
+
+        # Bare host prepends https://
+        url, note = A.normalize_target("example.com")
+        self.assertEqual(url, "https://example.com")
+        self.assertEqual(note, "Interpreted as https://example.com")
+
+        # Double-slash protocol-relative
+        url, note = A.normalize_target("//example.com/path")
+        self.assertEqual(url, "https://example.com/path")
+        self.assertEqual(note, "Interpreted as https://example.com/path")
+
+        # IDNA / Punycode conversion
+        url, note = A.normalize_target("münchen.de")
+        self.assertEqual(url, "https://xn--mnchen-3ya.de")
+        self.assertEqual(note, "Interpreted as https://xn--mnchen-3ya.de")
+
+        # Unchanged clean URL has no note
+        url, note = A.normalize_target("https://example.com")
+        self.assertEqual(url, "https://example.com")
+        self.assertIsNone(note)
+
+    def test_normalize_errors(self):
+        # Unsupported schemes
+        for bad in ["ftp://example.com", "file:///etc/passwd", "javascript:alert(1)", "mailto:info@example.com"]:
+            with self.assertRaises(ValueError):
+                A.normalize_target(bad)
+
+        # Invalid hosts
+        for bad in ["", "   ", "notadomain", "http://", "https://", "https://.com", "https://example.", "https://..."]:
+            with self.assertRaises(ValueError):
+                A.normalize_target(bad)
+
+        # Localhost and private / loopback / link-local IPs
+        for bad in ["localhost", "http://localhost:8080", "127.0.0.1", "http://127.0.0.1:3000",
+                    "192.168.1.1", "10.0.0.1", "172.16.0.1", "169.254.1.1"]:
+            with self.assertRaises(ValueError):
+                A.normalize_target(bad)
+
+    def test_http_fallback(self):
+        http_page = PAGE.replace("https://", "http://")
+
+        # Mock HTTPS failure -> HTTP success
+        class FallbackTF(FakeTF):
+            def fetch(self, urls, **kw):
+                if urls == [PAGE]:
+                    raise requests.ConnectionError("SSL certificate verify failed")
+                got, err = super().fetch(urls, **kw)
+                if http_page in urls:
+                    got[http_page] = {
+                        "url": http_page, "final_url": http_page, "title": "Our Guide", "text": BODY, "language": "en",
+                        "links": ["http://shop.example.com/a"], "published_date": None, "author": None,
+                        "page_metadata": {"canonical": "http://shop.example.com/blog/other/", "og": {"type": "article"}}
+                    }
+                return got, err
+
+        r = A.audit(PAGE, "best widgets", FallbackTF(), raw_fn=fake_raw)
+        titles = [f["title"] for f in r["findings"]]
+        self.assertIn("Site is not served over HTTPS", titles)
+        finding = next(f for f in r["findings"] if f["title"] == "Site is not served over HTTPS")
+        self.assertEqual(finding["sev"], "med")
+
+        # Both HTTPS and HTTP fail -> reports original failure
+        class BothFailTF(FakeTF):
+            def fetch(self, urls, **kw):
+                if urls[0].startswith("https://"):
+                    raise requests.ConnectionError("HTTPS connection failed")
+                raise requests.ConnectionError("HTTP connection failed")
+
+        r2 = A.audit("https://shop.example.com/blog/best-widgets/", "best widgets", BothFailTF(), raw_fn=fake_raw)
+        self.assertEqual(r2["status"], "error")
+        self.assertIn("HTTPS connection failed", r2["findings"][0]["evidence"])
+
+    def test_url_note_integration(self):
+        # Audit called with bare host produces url_note and shows in markdown
+        r = A.audit("shop.example.com/blog/best-widgets/", "best widgets", FakeTF(), raw_fn=fake_raw)
+        self.assertEqual(r["url_note"], "Interpreted as https://shop.example.com/blog/best-widgets/")
+        md = A.to_markdown(r)
+        self.assertIn("_Interpreted as https://shop.example.com/blog/best-widgets/_", md)
+
+    def test_cli_positional_query_and_interactive(self):
+        # 1. Positional query words
+        with mock.patch("sys.argv", ["ai_seo_auditor.py", "https://shop.example.com/blog/best-widgets/", "best", "widgets", "team"]), \
+             mock.patch.dict(os.environ, {"TINYFISH_API_KEY": "test_key"}), \
+             mock.patch("sys.stdout"), \
+             mock.patch("ai_seo_auditor.audit") as mock_audit, \
+             mock.patch("ai_seo_auditor.to_markdown", return_value=""), \
+             mock.patch("builtins.open", mock.mock_open()):
+            mock_audit.return_value = {"status": "ok", "scores": {"ai_readability": 90, "search_visibility": 90},
+                                       "rank": 1, "query": "best widgets team", "findings": []}
+            A.main()
+            mock_audit.assert_called_once()
+            self.assertEqual(mock_audit.call_args[0][1], "best widgets team")
+
+        # 2. Interactive prompts when no args provided
+        with mock.patch("sys.argv", ["ai_seo_auditor.py"]), \
+             mock.patch.dict(os.environ, {"TINYFISH_API_KEY": "test_key"}), \
+             mock.patch("sys.stdout"), \
+             mock.patch("builtins.input", side_effect=["https://shop.example.com/blog/best-widgets/", "interactive query"]), \
+             mock.patch("ai_seo_auditor.audit") as mock_audit, \
+             mock.patch("ai_seo_auditor.to_markdown", return_value=""), \
+             mock.patch("builtins.open", mock.mock_open()):
+            mock_audit.return_value = {"status": "ok", "scores": {"ai_readability": 90, "search_visibility": 90},
+                                       "rank": 1, "query": "interactive query", "findings": []}
+            A.main()
+            mock_audit.assert_called_once()
+            self.assertEqual(mock_audit.call_args[0][1], "interactive query")
+
+        # 3. Invalid URL exits with code 2
+        with mock.patch("sys.argv", ["ai_seo_auditor.py", "invalid_host"]), \
+             mock.patch.dict(os.environ, {"TINYFISH_API_KEY": "test_key"}), \
+             mock.patch("sys.stderr.write"):
+            with self.assertRaises(SystemExit) as cm:
+                A.main()
+            self.assertEqual(cm.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

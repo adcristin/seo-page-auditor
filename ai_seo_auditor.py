@@ -129,6 +129,106 @@ def norm(u: str) -> str:
     return host + (p.path.rstrip("/") or "") + (("?" + q) if q else "")
 
 
+def normalize_target(raw: str) -> tuple[str, str | None]:
+    """Normalize input URL and validate public web access.
+
+    Returns (url, note) where note is "Interpreted as {url}" if input changed, else None.
+    Raises ValueError for invalid URLs, unsupported schemes, or non-public hosts.
+    """
+    if not raw or not isinstance(raw, str):
+        raise ValueError("That doesn't look like a URL")
+
+    # 1. Cleaning: strip whitespace, surrounding quotes, and < >
+    s = raw.strip()
+    while True:
+        cleaned = s.strip(" \t\r\n'\"<>")
+        if cleaned == s:
+            break
+        s = cleaned
+    if not s:
+        raise ValueError("That doesn't look like a URL")
+
+    # Remove #fragments
+    s = s.split("#", 1)[0]
+
+    # 2. Scheme handling
+    if s.startswith("//"):
+        s = "https:" + s
+    elif "://" in s:
+        scheme_part, rest = s.split("://", 1)
+        scheme_part = scheme_part.lower()
+        if scheme_part not in ("http", "https"):
+            raise ValueError(f"Unsupported scheme '{scheme_part}'. TinyFish only supports http and https URLs.")
+        s = f"{scheme_part}://{rest}"
+    elif ":" in s:
+        prefix, rest = s.split(":", 1)
+        port_candidate = rest.split("/")[0]
+        if port_candidate.isdigit():
+            s = "https://" + s
+        else:
+            scheme_part = prefix.lower()
+            if scheme_part not in ("http", "https"):
+                raise ValueError(f"Unsupported scheme '{scheme_part}'. TinyFish only supports http and https URLs.")
+            s = f"{scheme_part}://{rest}"
+    else:
+        s = "https://" + s
+
+    p = urlparse(s)
+    scheme = p.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported scheme '{scheme}'. TinyFish only supports http and https URLs.")
+
+    # 3. Host validation
+    host_str = p.hostname
+    if not host_str:
+        raise ValueError("That doesn't look like a URL")
+
+    # Check localhost
+    if host_str.lower() == "localhost":
+        raise ValueError("TinyFish requires public web URLs; 'localhost' is not accessible.")
+
+    # Check IP address
+    try:
+        ip = ipaddress.ip_address(host_str)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+        ip = None
+
+    if is_ip:
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError(f"TinyFish requires public web URLs; '{host_str}' is a private or local address.")
+    else:
+        # Host must contain a dot
+        if "." not in host_str or host_str.startswith(".") or host_str.endswith("."):
+            raise ValueError("That doesn't look like a URL")
+
+    # 4. Punycode (IDNA)
+    try:
+        ascii_host = host_str.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise ValueError("That doesn't look like a URL")
+
+    # 5. Reconstruct normalized URL
+    netloc_parts = []
+    if p.username:
+        userinfo = p.username
+        if p.password:
+            userinfo += f":{p.password}"
+        netloc_parts.append(f"{userinfo}@")
+    netloc_parts.append(ascii_host)
+    if p.port:
+        netloc_parts.append(f":{p.port}")
+    new_netloc = "".join(netloc_parts)
+
+    path = p.path or ""
+    query = f"?{p.query}" if p.query else ""
+    normalized_url = f"{scheme}://{new_netloc}{path}{query}"
+
+    note = f"Interpreted as {normalized_url}" if normalized_url != raw else None
+    return normalized_url, note
+
+
 def tokens(s: str) -> list[str]:
     return re.findall(r"\w+", (s or "").casefold(), re.UNICODE)
 
@@ -631,26 +731,71 @@ def select_fix_first(findings: list[Finding]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- the audit
-def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = None, raw_fn=None) -> dict:
+def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = None, raw_fn=None, note: str | None = None) -> dict:
     raw_fn = raw_fn or raw_view
     F: list[Finding] = []
 
     def add(*a, **k):
         F.append(Finding(*a, **k))
 
+    url, internal_note = normalize_target(url)
+    url_note = note or internal_note
+
     p = urlparse(url)
     host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
 
     # ---- FETCH 1: the page as an AI tool extracts it (rendered, live)
-    try:
-        got, errs = tf.fetch([url], links=True, image_links=True, page_metadata=True)
-    except (requests.RequestException, Exception) as ex:
-        f_crit = Finding("access", "high", "Main page could not be fetched",
-                         f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
-                         "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
-                         "The primary page content is unavailable, making a full audit impossible.")
-        return {"status": "error", "url": url, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
+    http_fallback_used = False
+    if url.startswith("https://"):
+        try:
+            got, errs = tf.fetch([url], links=True, image_links=True, page_metadata=True)
+            e0 = next(iter(errs.values()), {})
+            err_msg = str(e0.get("error", "")).lower()
+            if not got and any(term in err_msg for term in ("ssl", "connect", "certificate")):
+                http_url = "http://" + url[len("https://"):]
+                got_http, errs_http = tf.fetch([http_url], links=True, image_links=True, page_metadata=True)
+                if got_http:
+                    got, errs = got_http, errs_http
+                    url = http_url
+                    http_fallback_used = True
+                    p = urlparse(url)
+                    host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
+        except (requests.RequestException, Exception) as ex:
+            is_conn_or_ssl = isinstance(ex, (requests.ConnectionError, requests.exceptions.SSLError)) or any(
+                term in str(ex).lower() for term in ("ssl", "connection", "connect", "certificate")
+            )
+            if is_conn_or_ssl:
+                http_url = "http://" + url[len("https://"):]
+                try:
+                    got, errs = tf.fetch([http_url], links=True, image_links=True, page_metadata=True)
+                    url = http_url
+                    http_fallback_used = True
+                    p = urlparse(url)
+                    host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
+                except Exception:
+                    f_crit = Finding("access", "high", "Main page could not be fetched",
+                                     f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
+                                     "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
+                                     "The primary page content is unavailable, making a full audit impossible.")
+                    return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                            "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
+            else:
+                f_crit = Finding("access", "high", "Main page could not be fetched",
+                                 f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
+                                 "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
+                                 "The primary page content is unavailable, making a full audit impossible.")
+                return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                        "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
+    else:
+        try:
+            got, errs = tf.fetch([url], links=True, image_links=True, page_metadata=True)
+        except (requests.RequestException, Exception) as ex:
+            f_crit = Finding("access", "high", "Main page could not be fetched",
+                             f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
+                             "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
+                             "The primary page content is unavailable, making a full audit impossible.")
+            return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                    "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
 
     page = next(iter(got.values()), None)
     e0 = next(iter(errs.values()), {})
@@ -664,7 +809,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                        "Check the URL for typos. If the page moved or was deleted, add a 301 redirect to its replacement."
                        + (f" Closest pages the search index knows on {host}: {', '.join(near)}." if near else ""), "both",
                        "Nothing at this URL can be indexed, quoted or ranked, and links pointing here are wasted.")
-        return {"status": "not_found", "url": url, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        return {"status": "not_found", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                 "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f404)], "calls": tf.calls}
     readable = bool(page and (page.get("text") or "").strip())
     if page is None or not readable:
@@ -838,6 +983,11 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
     # =========================================================== findings
     # -- access
+    if http_fallback_used:
+        add("access", "med", "Site is not served over HTTPS",
+            "The site failed to connect over HTTPS due to an SSL/connection error, but responded over HTTP.",
+            "Install a valid SSL/TLS certificate and configure HTTP requests to redirect to HTTPS.", "both",
+            "Search engines prioritize HTTPS sites and browsers display security warnings for unencrypted HTTP connections.")
     if norm(final_url) != norm(url):
         add("access", "low", "URL redirects", f"{url} -> {final_url}", "Link internally and in sitemaps to the final URL.", "search",
             "Redirect hops dilute signals and some AI fetchers do not follow them.")
@@ -1051,7 +1201,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     fix_first_titles = select_fix_first(F)
 
     return {
-        "url": url, "final_url": final_url, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "url": url, "final_url": final_url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "query": query, "query_source": query_src, "rank": rank, "serp_entry": seen, "serp_size": len(serp),
         "scores": {"ai_readability": ai, "search_visibility": vis},
         "page": {**me, "title": title, "description": desc, "description_source": desc_src, "canonical": meta.get("canonical"),
@@ -1066,9 +1216,10 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
 # --------------------------------------------------------------------------- report
 def to_markdown(r: dict) -> str:
+    note_line = f"  \n_{r['url_note']}_" if r.get("url_note") else ""
     if r.get("status") == "not_found":
         f = r["findings"][0]
-        return (f"# AI-readability & search audit\n\n**Page:** {r['url']}  \n**Checked live:** {r['checked_at']}\n\n## Verdict\n\n"
+        return (f"# AI-readability & search audit\n\n**Page:** {r['url']}{note_line}  \n**Checked live:** {r['checked_at']}\n\n## Verdict\n\n"
                 f"**Not auditable: this URL does not exist.** {f['evidence']}\n\n**Fix:** {f['fix']}\n\n"
                 "No scores were computed, because there is no page to score.\n")
     P, S = r["page"], r["scores"]
@@ -1076,7 +1227,7 @@ def to_markdown(r: dict) -> str:
     ld = ", ".join(t if n == 1 else f"{t} (x{n})" for t, n in Counter(P["jsonld_types"] or []).items())
     esc = lambda s: str(s).replace("|", "\\|").replace("\n", " ")
     rank = f"#{r['rank']}" if r["rank"] else f"not in top {r['serp_size']}"
-    o = [f"# AI-readability & search audit\n", f"**Page:** {r['final_url']}  \n**Checked live:** {r['checked_at']}  \n"
+    o = [f"# AI-readability & search audit\n", f"**Page:** {r['final_url']}{note_line}  \n**Checked live:** {r['checked_at']}  \n"
          f"**Query:** \"{r['query']}\" ({r['query_source']})\n",
          "## Verdict\n", f"- **AI readability:** {S['ai_readability']}/100", f"- **Search visibility for the query:** {rank} (score {S['search_visibility']}/100)",
          f"- **Findings:** {sum(f['sev'] == 'high' for f in r['findings'])} high, {sum(f['sev'] == 'med' for f in r['findings'])} medium, "
@@ -1160,7 +1311,8 @@ def load_dotenv(path: str = ".env") -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("url")
+    ap.add_argument("url", nargs="?", help="URL to audit")
+    ap.add_argument("query_words", nargs="*", help="target search query words (if -q is omitted)")
     ap.add_argument("-q", "--query", help="target search query (derived from the page if omitted)")
     ap.add_argument("-o", "--out", default="report", help="output prefix -> <out>.md and <out>.json")
     ap.add_argument("--country", help="country code for geo-targeted search, e.g. IN, US")
@@ -1177,9 +1329,40 @@ def main():
     key = os.environ.get("TINYFISH_API_KEY")
     if not key:
         sys.exit("Set TINYFISH_API_KEY (free at agent.tinyfish.ai/api-keys).")
-    url = a.url if re.match(r"https?://", a.url) else "https://" + a.url
+
+    raw_url = a.url
+    interactive = False
+    if not raw_url:
+        interactive = True
+        try:
+            raw_url = input("URL: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(2)
+        if not raw_url:
+            sys.stderr.write("Error: URL is required.\n")
+            sys.exit(2)
+
+    query = a.query
+    if not query:
+        if a.query_words:
+            query = " ".join(a.query_words)
+        elif interactive:
+            try:
+                raw_q = input("Target query (optional): ").strip()
+                query = raw_q or None
+            except EOFError:
+                query = None
+            except KeyboardInterrupt:
+                sys.exit(2)
+
     try:
-        res = audit(url, a.query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country)
+        url, note = normalize_target(raw_url)
+    except ValueError as ex:
+        sys.stderr.write(f"Error: {ex}\n")
+        sys.exit(2)
+
+    try:
+        res = audit(url, query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country, note=note)
     except (requests.RequestException, Exception) as ex:
         sys.stderr.write(f"Error: {str(ex).splitlines()[0]} (Exit code 2)\n")
         sys.exit(2)
