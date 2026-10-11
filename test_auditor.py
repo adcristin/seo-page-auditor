@@ -607,5 +607,158 @@ class Units(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
 
 
+    def test_finding_dataclass_fields_and_dict(self):
+        f = A.Finding("access", "low", "title", "ev", "fix", "ai")
+        self.assertEqual(f.confidence, "")
+        self.assertEqual(f.verify, "")
+        d = A.asdict(f)
+        self.assertIn("confidence", d)
+        self.assertIn("verify", d)
+        self.assertEqual(d["confidence"], "")
+        self.assertEqual(d["verify"], "")
+
+        f2 = A.Finding("access", "high", "title2", "ev2", "fix2", "both", confidence="verified", verify="curl -sI https://example.com")
+        self.assertEqual(f2.confidence, "verified")
+        self.assertEqual(f2.verify, "curl -sI https://example.com")
+        d2 = A.asdict(f2)
+        self.assertEqual(d2["confidence"], "verified")
+        self.assertEqual(d2["verify"], "curl -sI https://example.com")
+
+    def test_confidence_and_verify_categorization(self):
+        r = A.audit(PAGE, "best widgets for small teams", FakeTF(), raw_fn=fake_raw)
+        f_map = {f["title"]: f for f in r["findings"]}
+
+        # 1. "verified" findings: raw HTML/headers/robots
+        self.assertIn("robots.txt blocks search crawlers for this path", f_map)
+        f_robots = f_map["robots.txt blocks search crawlers for this path"]
+        self.assertEqual(f_robots["confidence"], "verified")
+        self.assertIn("curl", f_robots["verify"])
+        self.assertIn("robots.txt", f_robots["verify"])
+
+        self.assertIn("Much of the text only exists after JavaScript runs", f_map)
+        f_js = f_map["Much of the text only exists after JavaScript runs"]
+        self.assertEqual(f_js["confidence"], "verified")
+        self.assertIn("curl", f_js["verify"])
+
+        self.assertIn("No structured data (JSON-LD)", f_map)
+        f_ld = f_map["No structured data (JSON-LD)"]
+        self.assertEqual(f_ld["confidence"], "verified")
+        self.assertIn("curl", f_ld["verify"])
+        self.assertIn("application/ld+json", f_ld["verify"])
+
+        self.assertIn("Canonical points to a different URL", f_map)
+        f_can = f_map["Canonical points to a different URL"]
+        self.assertEqual(f_can["confidence"], "verified")
+        self.assertIn("curl", f_can["verify"])
+        self.assertIn("canonical", f_can["verify"])
+
+        # 2. "likely" findings: Fetch extraction / Search results
+        self.assertIn("Query terms missing from your title tag", f_map)
+        f_term = f_map["Query terms missing from your title tag"]
+        self.assertEqual(f_term["confidence"], "likely")
+
+        self.assertIn("Page not found in sitemap", f_map)
+        f_sm = f_map["Page not found in sitemap"]
+        self.assertEqual(f_sm["confidence"], "likely")
+
+        # 3. "unverified" findings: Fetch limitations (unreadable sitemap, critical fetch fail)
+        class UnreadableSitemapTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                if any(u.endswith("sitemap.xml") for u in urls):
+                    return {}, {u: {"url": u, "error": "timeout", "status": None} for u in urls}
+                return got, err
+
+        r_sm = A.audit(PAGE, "best widgets", UnreadableSitemapTF(), raw_fn=fake_raw)
+        f_sm_map = {f["title"]: f for f in r_sm["findings"]}
+        self.assertIn("Declared sitemap could not be read", f_sm_map)
+        f_unverified_sm = f_sm_map["Declared sitemap could not be read"]
+        self.assertEqual(f_unverified_sm["confidence"], "unverified")
+        self.assertIn("curl", f_unverified_sm["verify"])
+
+        faulty = FaultyTF()
+        faulty.set_persistent_fail("connection")
+        r_fail = A.audit(PAGE, "best widgets", faulty, raw_fn=fake_raw)
+        f_crit = r_fail["findings"][0]
+        self.assertEqual(f_crit["title"], "Main page could not be fetched")
+        self.assertEqual(f_crit["confidence"], "unverified")
+        self.assertIn("curl -sI", f_crit["verify"])
+
+    def test_high_severity_wording_conditional(self):
+        # 1. Fetch failure (page is None): error message in evidence
+        class BlockedTF(FakeTF):
+            def fetch(self, urls, **kw):
+                if urls == [PAGE] and not kw.get("include_selectors"):
+                    return {}, {PAGE: {"url": PAGE, "error": "forbidden", "status": 403}}
+                return super().fetch(urls, **kw)
+
+        r_err = A.audit(PAGE, "best widgets", BlockedTF(), raw_fn=fake_raw)
+        f_err = r_err["findings"][0]
+        self.assertEqual(f_err["title"], "AI tools cannot extract any text from this page")
+        self.assertIn("TinyFish Fetch returned an error: forbidden (HTTP 403)", f_err["evidence"])
+        self.assertEqual(f_err["confidence"], "likely")
+
+        # 2. Fetch returned empty body: states empty body
+        class EmptyTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                if urls == [PAGE] and not kw.get("include_selectors"):
+                    got[PAGE] = {"url": PAGE, "final_url": PAGE, "title": "Empty", "text": "", "page_metadata": {}}
+                return got, err
+
+        r_empty = A.audit(PAGE, "best widgets", EmptyTF(), raw_fn=fake_raw)
+        f_empty = r_empty["findings"][0]
+        self.assertEqual(f_empty["title"], "AI tools cannot extract any text from this page")
+        self.assertEqual(f_empty["evidence"], "TinyFish Fetch returned an empty body.")
+
+        # 3. Only N words extracted: conditional evidence reflecting exact count, not absolute "almost no text"
+        class ThinTF(FakeTF):
+            def fetch(self, urls, **kw):
+                got, err = super().fetch(urls, **kw)
+                if urls == [PAGE] and not kw.get("include_selectors"):
+                    got[PAGE] = {"url": PAGE, "final_url": PAGE, "title": "Guide", "text": "word " * 50, "language": "en",
+                                 "page_metadata": {"canonical": PAGE}}
+                return got, err
+
+        r_thin = A.audit(PAGE, "best widgets", ThinTF(), raw_fn=fake_raw)
+        f_thin = next((f for f in r_thin["findings"] if "words extracted" in f["title"]), None)
+        self.assertIsNotNone(f_thin)
+        self.assertIn("extracted 50 words (threshold is 150 words)", f_thin["evidence"])
+        self.assertNotIn("almost no text", f_thin["evidence"])
+
+    def test_markdown_confidence_verify_rendering(self):
+        r = A.audit(PAGE, "best widgets for small teams", FakeTF(), raw_fn=fake_raw)
+        md = A.to_markdown(r)
+        self.assertIn("## Findings", md)
+        for f in r["findings"]:
+            if f.get("confidence") and f.get("verify"):
+                expected_line = f"_Confidence: {f['confidence']} | Verify: {f['verify']}_"
+                self.assertIn(expected_line, md)
+
+        # Ensure findings without confidence/verify do not render empty tags
+        r_mock = {
+            "final_url": "https://example.com/", "checked_at": "now", "query": "q", "query_source": "s",
+            "rank": 1, "serp_entry": None, "serp_size": 10, "scores": {"ai_readability": 100, "search_visibility": 100},
+            "page": {
+                "words": 500, "title": "T", "h1": "H", "h2": 0, "tables": 0, "lists": 0,
+                "description": "D", "description_source": "S", "canonical": "C", "robots": "R",
+                "images": 0, "images_missing_alt": 0, "links": 0, "excerpt": "E",
+                "jsonld_types": [], "raw_status": 200, "published": None, "author": None
+            },
+            "site": {"robots_txt": False, "llms_txt": False, "in_sitemap": True, "blocked_bots": []},
+            "competitors": [],
+            "competitor_errors": [],
+            "findings": [
+                {"title": "Sample", "sev": "low", "fix": "Fix text", "evidence": "ev", "area": "access", "affects": "ai", "ties": ""}
+            ],
+            "fix_first": [],
+            "calls": []
+        }
+        md_mock = A.to_markdown(r_mock)
+        self.assertNotIn("_Confidence:", md_mock)
+        self.assertNotIn("Verify:", md_mock)
+
+
 if __name__ == "__main__":
     unittest.main()
+

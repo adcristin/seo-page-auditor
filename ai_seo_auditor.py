@@ -118,6 +118,8 @@ class Finding:
     fix: str
     affects: str   # ai | search | both
     ties: str = ""  # how this readability issue turns into a visibility issue
+    confidence: str = ""  # verified | likely | unverified
+    verify: str = ""      # one-line command or step to check it
 
 
 def norm(u: str) -> str:
@@ -718,7 +720,7 @@ def select_fix_first(findings: list[Finding]) -> list[str]:
         if i + 1 < len(filtered):
             f1, f2 = f, filtered[i+1]
             if {f1.title, f2.title} == {"Query terms missing from your title tag", "Query terms missing from your H1"}:
-                merged.append(Finding(f1.area, f1.sev, "Work the query terms into your title and H1", f1.evidence, f1.fix, f1.affects, f1.ties))
+                merged.append(Finding(f1.area, f1.sev, "Work the query terms into your title and H1", f1.evidence, f1.fix, f1.affects, f1.ties, confidence=f1.confidence, verify=f1.verify))
                 skip_next = True
                 continue
         merged.append(f)
@@ -776,14 +778,16 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                     f_crit = Finding("access", "high", "Main page could not be fetched",
                                      f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
                                      "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
-                                     "The primary page content is unavailable, making a full audit impossible.")
+                                     "The primary page content is unavailable, making a full audit impossible.",
+                                     confidence="unverified", verify=f'curl -sI "{url}"')
                     return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                             "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
             else:
                 f_crit = Finding("access", "high", "Main page could not be fetched",
                                  f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
                                  "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
-                                 "The primary page content is unavailable, making a full audit impossible.")
+                                 "The primary page content is unavailable, making a full audit impossible.",
+                                 confidence="unverified", verify=f'curl -sI "{url}"')
                 return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                         "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
     else:
@@ -793,7 +797,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             f_crit = Finding("access", "high", "Main page could not be fetched",
                              f"The TinyFish API returned a persistent error after retries: {str(ex).splitlines()[0]}.",
                              "Check your network connection and the TinyFish API status. If the issue persists, verify the URL is accessible to AI crawlers.", "both",
-                             "The primary page content is unavailable, making a full audit impossible.")
+                             "The primary page content is unavailable, making a full audit impossible.",
+                             confidence="unverified", verify=f'curl -sI "{url}"')
             return {"status": "error", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                     "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f_crit)], "calls": tf.calls}
 
@@ -808,17 +813,25 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         f404 = Finding("access", "high", "This URL does not exist (404)", f"TinyFish Fetch: {e0.get('error')} (HTTP {e0.get('status')}).",
                        "Check the URL for typos. If the page moved or was deleted, add a 301 redirect to its replacement."
                        + (f" Closest pages the search index knows on {host}: {', '.join(near)}." if near else ""), "both",
-                       "Nothing at this URL can be indexed, quoted or ranked, and links pointing here are wasted.")
+                       "Nothing at this URL can be indexed, quoted or ranked, and links pointing here are wasted.",
+                       confidence="likely", verify=f'curl -sI "{url}"')
         return {"status": "not_found", "url": url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                 "scores": {"ai_readability": None, "search_visibility": None}, "findings": [asdict(f404)], "calls": tf.calls}
     readable = bool(page and (page.get("text") or "").strip())
     if page is None or not readable:
         e = next(iter(errs.values()), {})
+        if page is None:
+            ev = f"TinyFish Fetch returned an error: {e.get('error')} (HTTP {e.get('status')})."
+            fx = ("Check for bot blocking (WAF/Cloudflare rules), login/consent walls, or server errors. "
+                  "Test with curl and a normal browser UA, then allow verified AI crawlers.")
+        else:
+            ev = "TinyFish Fetch returned an empty body."
+            fx = ("Check for bot blocking (WAF/Cloudflare rules), login/consent walls, or content rendered only after user interaction. "
+                  "Test with curl and a normal browser UA, then allow verified AI crawlers.")
         add("access", "high", "AI tools cannot extract any text from this page",
-            f"TinyFish Fetch returned {'an error: ' + str(e.get('error')) + ' (HTTP ' + str(e.get('status')) + ')' if page is None else 'an empty body'}.",
-            "Check for bot blocking (WAF/Cloudflare rules), login/consent walls, or content rendered only after user interaction. "
-            "Test with curl and a normal browser UA, then allow verified AI crawlers.", "both",
-            "A page that AI fetchers cannot read cannot be quoted or cited by them, and may also be missing from indexes built from the same crawl.")
+            ev, fx, "both",
+            "A page that AI fetchers cannot read cannot be quoted or cited by them, and may also be missing from indexes built from the same crawl.",
+            confidence="likely", verify=f'curl -sL "{url}" | head -n 30')
         page = page or {}
     md = page.get("text") or ""
     meta = page.get("page_metadata") or {}
@@ -828,7 +841,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         add("access", "high", "Fetch was served a bot-challenge page, not your content",
             f"Title {title!r}, {count_words(md)} words, with challenge wording in the body.",
             "Allow verified crawlers through the WAF/bot protection for this path, then re-run. Until then the audit below describes the challenge page.", "both",
-            "AI fetchers that hit the same wall see no content to quote or cite.")
+            "AI fetchers that hit the same wall see no content to quote or cite.",
+            confidence="likely", verify=f'curl -sL "{url}" | head -n 30')
     h1 = profile(page, [])["h1"]
     path = urlparse(final_url).path or "/"
     if urlparse(final_url).query:
@@ -859,7 +873,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     desc = raw["meta"].get("description", "") if (raw and is_html_raw) else (page.get("description") or "")
 
     if raw and not raw.get("non_html") and raw.get("truncated"):
-        add("content", "info", "Page content truncated", f"The page exceeds 3MB and was truncated for analysis.", "No action needed unless critical content is only found at the very bottom of a huge page.", "ai")
+        add("content", "info", "Page content truncated", f"The page exceeds 3MB and was truncated for analysis.", "No action needed unless critical content is only found at the very bottom of a huge page.", "ai",
+            confidence="verified", verify=f'curl -sI "{final_url}" | grep -i content-length')
 
     # ---- query: given, or derived from the page itself
     query_src = "given"
@@ -869,7 +884,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     if not terms:
         add("content", "low", "Query terms could not be analysed",
             "The provided query contains no recognisable words (e.g. it is composed only of symbols or emojis).",
-            "Provide a more descriptive query containing alphanumeric characters.", "search")
+            "Provide a more descriptive query containing alphanumeric characters.", "search",
+            confidence="verified", verify=f'echo "{query}"')
 
     me = profile(page, terms)
     me["h1"], me["t_h1"] = h1, term_hits(terms, h1)
@@ -928,13 +944,15 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     except (requests.RequestException, Exception) as ex:
         add("visibility", "low", "Search unavailable, visibility not measured",
             f"The TinyFish Search API returned a persistent error: {str(ex).splitlines()[0]}.",
-            "No action needed; re-run the audit later.", "search")
+            "No action needed; re-run the audit later.", "search",
+            confidence="unverified", verify="curl -sI https://api.search.tinyfish.ai/")
 
     # Note in report if CJK fallback was used
     if is_cjk(md):
         add("content", "info", "CJK matching fallback active",
             "This page appears to use a script without spaces (CJK). The auditor has switched to character bigram matching for terms and topic gaps.",
-            "No action needed.", "ai")
+            "No action needed.", "ai",
+            confidence="verified", verify=f'curl -sL "{final_url}" | head -n 30')
 
     own, own_entry = [], None
     if rank is None:  # diagnostic: is it indexed at all, if we restrict to its own domain?
@@ -987,60 +1005,71 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         add("access", "med", "Site is not served over HTTPS",
             "The site failed to connect over HTTPS due to an SSL/connection error, but responded over HTTP.",
             "Install a valid SSL/TLS certificate and configure HTTP requests to redirect to HTTPS.", "both",
-            "Search engines prioritize HTTPS sites and browsers display security warnings for unencrypted HTTP connections.")
+            "Search engines prioritize HTTPS sites and browsers display security warnings for unencrypted HTTP connections.",
+            confidence="verified", verify=f'curl -sI "https://{p.netloc}"')
     if norm(final_url) != norm(url):
         add("access", "low", "URL redirects", f"{url} -> {final_url}", "Link internally and in sitemaps to the final URL.", "search",
-            "Redirect hops dilute signals and some AI fetchers do not follow them.")
+            "Redirect hops dilute signals and some AI fetchers do not follow them.",
+            confidence="verified", verify=f'curl -sI "{url}" | grep -i location')
     if robots_txt:
         for role, sev, why in (("search", "high", "This bot builds the index AI search answers cite."),
                                ("user", "med", "This bot fetches the page when a user asks an AI assistant about it.")):
             bl = [b for b, r in BOTS.items() if r == role and blocked.get(b)]
             if bl:
                 add("access", sev, f"robots.txt blocks {role} crawlers for this path", f"Blocked for: {', '.join(bl)} (path {path}).",
-                    "Remove or narrow the matching Disallow rule in robots.txt, or add an explicit Allow for these agents.", "both", why)
+                    "Remove or narrow the matching Disallow rule in robots.txt, or add an explicit Allow for these agents.", "both", why,
+                    confidence="verified", verify=f'curl -s "{origin}/robots.txt"')
         tr = [b for b, r in BOTS.items() if r == "training" and blocked.get(b)]
         if tr:
             add("access", "info", "Training crawlers are blocked (policy choice)", f"Blocked: {', '.join(tr)}.",
-                "No action needed if intentional. Blocking these does not by itself hide you from AI search citations.", "ai")
+                "No action needed if intentional. Blocking these does not by itself hide you from AI search citations.", "ai",
+                confidence="verified", verify=f'curl -s "{origin}/robots.txt"')
     tags = " ".join(dict.fromkeys(" ".join([str(meta.get("robots") or ""), (raw or {}).get("meta", {}).get("robots", ""), (raw or {}).get("x_robots", "")]).lower().split()))
     if "noindex" in tags:
         add("access", "high", "Page is marked noindex", f"Robots directives seen: {tags.strip()}", "Remove noindex (meta robots or X-Robots-Tag header) if you want this page found.", "both",
-            "Engines drop noindex pages from results entirely.")
+            "Engines drop noindex pages from results entirely.",
+            confidence="verified", verify=f'curl -sI "{final_url}" | grep -i x-robots-tag')
     if re.search(r"nosnippet|max-snippet:\s*0", tags):
         add("access", "med", "Snippet use is forbidden", f"Robots directives seen: {tags.strip()}", "Remove nosnippet / max-snippet:0 so engines and AI answers may quote you.", "both",
-            "No snippet permission means no quoted answer text, which lowers click-through even when you rank.")
+            "No snippet permission means no quoted answer text, which lowers click-through even when you rank.",
+            confidence="verified", verify=f'curl -sI "{final_url}" | grep -i x-robots-tag')
     if readable:
         can = meta.get("canonical")
         if not can:
             add("metadata", "med", "No canonical URL", "page_metadata has no canonical.", f'Add <link rel="canonical" href="{final_url}"> in <head>.', "search",
-                "Without it, duplicate/parameter URLs compete with each other for the same query.")
+                "Without it, duplicate/parameter URLs compete with each other for the same query.",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'rel="canonical"\'')
         elif norm(can) != norm(final_url):
             add("metadata", "high", "Canonical points to a different URL", f"canonical={can}  but fetched page is {final_url}",
                 "Point the canonical at this URL, or expect the other URL to be indexed instead of this one.", "search",
-                "This page tells engines to rank another page for its content.")
+                "This page tells engines to rank another page for its content.",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'rel="canonical"\'')
     if sm_found is False:
         add("access", "med", "Page not found in sitemap", f"Checked {sm_checked} URLs across {len(sm_got)} sitemap file(s).", "Add the page to sitemap.xml with an accurate <lastmod>.", "search",
-            "Discovery then depends on internal links alone.")
+            "Discovery then depends on internal links alone.",
+            confidence="likely", verify=f'curl -sL "{sm_urls[0]}" | grep -i "{p.path}"')
     elif sm_found is None and smaps:
         why = next(iter(sm_err.values()), {}).get("error", "no URLs in the response")
         add("access", "low", "Declared sitemap could not be read", f"robots.txt points to {', '.join(sm_urls[:2])} but Fetch got no usable URL list ({why}).",
-            "Open it in a browser to confirm it works. This may be a Fetch limitation, so treat it as unverified.", "search")
+            "Open it in a browser to confirm it works. This may be a Fetch limitation, so treat it as unverified.", "search",
+            confidence="unverified", verify=f'curl -sL "{sm_urls[0]}" | head -n 20')
     elif sm_found is None:
         add("access", "med", "No sitemap found", f"{sm_urls[0]} returned no URL list (missing, or a single-page app answering with its home page).",
-            "Publish sitemap.xml and reference it from robots.txt with a Sitemap: line.", "search", "Discovery then depends on internal links alone.")
+            "Publish sitemap.xml and reference it from robots.txt with a Sitemap: line.", "search", "Discovery then depends on internal links alone.",
+            confidence="likely", verify=f'curl -sI "{origin}/sitemap.xml"')
     if not llms_txt:
         add("access", "low", "No llms.txt", f"{origin}/llms.txt returned nothing.",
-            "Optional: publish llms.txt listing key pages with one-line descriptions. Adoption is uneven and no major engine documents it as a ranking factor.", "ai")
+            "Optional: publish llms.txt listing key pages with one-line descriptions. Adoption is uneven and no major engine documents it as a ranking factor.", "ai",
+            confidence="verified", verify=f'curl -sI "{origin}/llms.txt"')
 
     # -- content (what AI tools can read)
     if readable:
         if me["words"] < 150:
-            add("content", "high", f"Only {me['words']} words extracted", "Fetch rendered the page in a real browser and still found almost no text.",
-                "Put the substantive answer in HTML text, not images/canvas/widgets.", "both", "Little extractable text means little for an engine to match against a query.")
-    if readable:
-        if me["words"] < 150:
-            add("content", "high", f"Only {me['words']} words extracted", "Fetch rendered the page in a real browser and still found almost no text.",
-                "Put the substantive answer in HTML text, not images/canvas/widgets.", "both", "Little extractable text means little for an engine to match against a query.")
+            words_ev = (f"Fetch rendered the page in a real browser and extracted {me['words']} words (threshold is 150 words)."
+                        if me["words"] > 0 else "Fetch rendered the page in a real browser and extracted 0 words.")
+            add("content", "high", f"Only {me['words']} words extracted", words_ev,
+                "Put the substantive answer in HTML text, not images/canvas/widgets.", "both", "Little extractable text means little for an engine to match against a query.",
+                confidence="likely", verify=f'curl -sL "{final_url}" | wc -w')
 
         if raw and not raw.get("non_html"):
             cov, miss = coverage(md, raw["text"])
@@ -1049,46 +1078,56 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 add("content", sev, "Much of the text only exists after JavaScript runs",
                     f"{round((1 - cov) * 100)}% of sampled passages from the rendered page are absent from the raw HTML. Example passage missing from raw HTML: \"{miss[0]}...\"",
                     "Server-side render or statically generate the main content (SSR/SSG). Verify with `curl -s URL | grep -i 'a phrase from the page'`.", "both",
-                    "Crawlers that do not execute JavaScript, which reportedly includes several AI crawlers, index and quote only the raw HTML.")
+                    "Crawlers that do not execute JavaScript, which reportedly includes several AI crawlers, index and quote only the raw HTML.",
+                    confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "{miss[0][:30]}"')
             if not raw["jsonld"]:
                 add("content", "med", "No structured data (JSON-LD)", "No application/ld+json block in the raw HTML.",
                     "Add JSON-LD. Starter based on what Fetch extracted:\n" + jsonld_skeleton(me, desc, meta, final_url,
                     (meta.get("og") or {}).get("type") == "article" or bool(re.search(r"/(blog|news|articles?|posts?|guides?)/", path))), "both",
-                    "Structured data gives engines and AI tools unambiguous facts (type, author, date) instead of inferring them.")
+                    "Structured data gives engines and AI tools unambiguous facts (type, author, date) instead of inferring them.",
+                    confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "application/ld+json"')
             else:
                 types, bad, gaps = ld_summary(raw["jsonld"])
                 if bad:
-                    add("content", "med", "Invalid JSON-LD", f"{bad} block(s) fail to parse.", "Validate with a JSON linter and Google's Rich Results Test.", "both")
+                    add("content", "med", "Invalid JSON-LD", f"{bad} block(s) fail to parse.", "Validate with a JSON linter and Google's Rich Results Test.", "both",
+                        confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "application/ld+json"')
                 for t, m in gaps:
-                    add("content", "low", f"{t} JSON-LD is missing properties", f"Missing: {', '.join(m)}.", f"Add {', '.join(m)} to the {t} object.", "both")
+                    add("content", "low", f"{t} JSON-LD is missing properties", f"Missing: {', '.join(m)}.", f"Add {', '.join(m)} to the {t} object.", "both",
+                        confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "application/ld+json"')
         elif raw and raw.get("non_html"):
-            add("access", "low", "Not an HTML page", f"Content-Type is {raw['content_type']}.", "No action needed if this is intentional (e.g. PDF). If this should be a web page, check your server configuration.", "both")
+            add("access", "low", "Not an HTML page", f"Content-Type is {raw['content_type']}.", "No action needed if this is intentional (e.g. PDF). If this should be a web page, check your server configuration.", "both",
+                confidence="verified", verify=f'curl -sI "{final_url}" | grep -i content-type')
         elif raw_err:
-            add("content", "info", "Raw HTML check skipped", raw_err, "Re-run with network access to the page.", "ai")
-        heads = dom_heads or md_stats(md)[0]
+            add("content", "info", "Raw HTML check skipped", raw_err, "Re-run with network access to the page.", "ai",
+                confidence="unverified", verify=f'curl -sI "{final_url}"')
         heads = dom_heads or md_stats(md)[0]
         h1s = [t for l, t in heads if l == 1]
         if not h1s:
             add("content", "med", "No H1 in extracted content", f"No <h1> found {'in the rendered HTML' if dom_heads else 'in the extracted content'}.", "Add one H1 stating the page's main topic in plain words.", "both",
-                "The H1 is the strongest on-page label an extractor has for what the page is about.")
+                "The H1 is the strongest on-page label an extractor has for what the page is about.",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -i "<h1"')
         elif len(h1s) > 1:
-            add("content", "low", f"{len(h1s)} H1s", "; ".join(h1s[:4]), "Keep one H1; demote the rest to H2.", "ai")
+            add("content", "low", f"{len(h1s)} H1s", "; ".join(h1s[:4]), "Keep one H1; demote the rest to H2.", "ai",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -i "<h1"')
         sk = first_skip(heads)
         if sk:
             (la, ta), (lb, tb) = sk
             add("content", "low", "Heading levels skip", f'H{la} "{ta[:50]}" is followed directly by H{lb} "{tb[:50]}".',
-                "Use consecutive heading levels so sections nest cleanly.", "ai")
+                "Use consecutive heading levels so sections nest cleanly.", "ai",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "<h[1-6]"')
         real = [i for i in images if not i["decorative"]]
         noalt = [i for i in real if i["alt"] is None]
         if len(real) >= 3 and len(noalt) / len(real) > 0.3:
             add("content", "med", f"{len(noalt)} of {len(real)} content images have no alt attribute",
                 "Examples: " + ", ".join(i["src"][:70] for i in noalt[:3]), "Add descriptive alt text (alt=\"\" only for purely decorative images).", "both",
-                "AI tools cannot see the image; without alt text its information is lost, and image search cannot place it.")
+                "AI tools cannot see the image; without alt text its information is lost, and image search cannot place it.",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -i "<img"')
         if is_article and not (page.get("published_date") and page.get("author")):
             miss = [k for k, v in (("published date", page.get("published_date")), ("author", page.get("author"))) if not v]
             add("content", "med", f"Article exposes no {' or '.join(miss)}", "TinyFish Fetch found none, so an AI tool reading the page will not have it either.",
                 "Show byline and date in visible HTML and mirror them in Article JSON-LD (datePublished, dateModified, author).", "both",
-                "Freshness and attribution are how AI answers decide whether a page is safe to cite.")
+                "Freshness and attribution are how AI answers decide whether a page is safe to cite.",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "datePublished|author"')
 
         # -- metadata
         if not title or len(title) < 20 or len(title) > 65:
@@ -1096,58 +1135,65 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             idea = suggest_title(f"{h1} - {query}" if h1 and me["t_title"] is not None and me["t_title"] < 1 else (h1 or title or query), title, site_name)
             add("metadata", "med", "Title tag length" if title else "Missing title tag", f"Title ({len(title)} chars): {title!r}. Aim for roughly 30-60.",
                 "Rewrite it to state the page topic in plain words." + (f" Starting point (edit it): {idea}" if idea and idea != title else ""), "search",
-                "The title is the main relevance signal and the clickable headline in results.")
+                "The title is the main relevance signal and the clickable headline in results.",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "<title"')
         if not desc:
             add("metadata", "med", "No meta description", f"None found (source: {desc_src}).", "Write a 120-160 character summary containing the primary query terms.", "search",
-                "Without it the engine invents a snippet from body text.")
+                "Without it the engine invents a snippet from body text.",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'<meta name="description"\'')
         elif not 70 <= len(desc) <= 160:
-            add("metadata", "low", "Meta description length", f"{len(desc)} chars.", "Aim for 120-160 characters.", "search")
+            add("metadata", "low", "Meta description length", f"{len(desc)} chars.", "Aim for 120-160 characters.", "search",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'<meta name="description"\'')
         og = meta.get("og") or {}
         og_miss = [k for k in ("title", "description", "image") if not og.get(k)]
         twitter_card = (meta.get("twitter") or {}).get("card")
 
         if og_miss:
-            # OG is incomplete, list missing OG tags and also twitter:card if missing
             miss_list = [f"og:{k}" for k in og_miss]
             if not twitter_card:
                 miss_list.append("twitter:card")
 
             add("metadata", "low", "Open Graph tags incomplete",
                 f"Missing {', '.join(miss_list)}.",
-                "Add the missing og: tags; link previews and many AI tools use them.", "both")
+                "Add the missing og: tags; link previews and many AI tools use them.", "both",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'property="og:\'')
         elif not twitter_card:
-            # OG is complete, but twitter:card is missing.
-            # The user said: "Treat twitter:card missing as a gap only if og:title/og:description/og:image are not all present"
-            # This means if OG is complete, twitter:card missing is NOT a finding.
             pass
         if not meta.get("viewport"):
-            add("metadata", "low", "No viewport meta tag", "", 'Add <meta name="viewport" content="width=device-width, initial-scale=1">.', "search", "Mobile-first indexing.")
+            add("metadata", "low", "No viewport meta tag", "", 'Add <meta name="viewport" content="width=device-width, initial-scale=1">.', "search", "Mobile-first indexing.",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i \'name="viewport"\'')
         if not page.get("language"):
-            add("metadata", "low", "No language declared", "", 'Add <html lang="en"> (or the right code).', "ai")
+            add("metadata", "low", "No language declared", "", 'Add <html lang="en"> (or the right code).', "ai",
+                confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "<html"')
 
     # -- visibility (Search) tied to readability (Fetch)
     if rank is None:
         if own_entry:
             add("visibility", "high", f"Indexed, but not in the top {len(serp)} for \"{query}\"",
                 f"Found on {host} via site: search as \"{own_entry['title']}\", but absent from the general results.",
-                "The page is known to the engine but not competitive for this query. See the comparison table for what the pages above it do.", "search")
+                "The page is known to the engine but not competitive for this query. See the comparison table for what the pages above it do.", "search",
+                confidence="likely", verify=f'Search for "{query}" on Google or Bing')
         else:
             add("visibility", "high", "Page did not surface even when searching its own domain",
                 f"Neither \"{query}\" (top {len(serp)}) nor a site:{host} search returned {norm(final_url)}.",
                 "Suspect indexing: check noindex, canonical, robots.txt, sitemap and internal links first; then request indexing in Search Console / Bing Webmaster Tools.", "both",
-                "Nothing else matters for visibility until the page is in the index.")
+                "Nothing else matters for visibility until the page is in the index.",
+                confidence="likely", verify=f'Search "site:{host}" on Google or Bing')
     elif rank > 10:
-        add("visibility", "med", f"Ranks #{rank} for \"{query}\"", "Below the first results page.", "See the comparison table below.", "search")
+        add("visibility", "med", f"Ranks #{rank} for \"{query}\"", "Below the first results page.", "See the comparison table below.", "search",
+            confidence="likely", verify=f'Search for "{query}" on Google or Bing')
     if seen:
         st, sn = seen.get("title", ""), seen.get("snippet", "")
         if title_rewritten(st, title, h1):
             add("visibility", "med", "Search shows a different title than your <title>", f'Shown: "{st}"   Yours: "{title}"',
                 "Engines rewrite titles that are too long, boilerplate-heavy, or that disagree with the H1. Make title and H1 say the same thing in under ~60 characters.", "search",
-                "A rewritten title means the engine did not trust your markup to describe the page.")
+                "A rewritten title means the engine did not trust your markup to describe the page.",
+                confidence="likely", verify=f'Compare search title with: curl -sL "{final_url}" | grep -i "<title"')
         src = snippet_source(sn, desc, md)
         if src == "page body" and readable:
             add("visibility", "low", "Snippet is pulled from body text, not your meta description", f"Shown: '{sn[:160]}'",
-                "Rewrite the meta description to answer the query directly, using its key terms." if desc else "Add a meta description.", "search")
+                "Rewrite the meta description to answer the query directly, using its key terms." if desc else "Add a meta description.", "search",
+                confidence="likely", verify=f'Compare search snippet with: curl -sL "{final_url}" | grep -i \'<meta name="description"\'')
     if terms and readable:
         cmp_ = lambda k: avg([c[k] for c in comps])
         for key, label, sev in (("t_title", "title tag", "high"), ("t_h1", "H1", "med"), ("t_first", "first 120 words", "med")):
@@ -1156,7 +1202,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 miss = [t for t in terms if not term_hits([t], {"t_title": title, "t_h1": h1, "t_first": " ".join(md.split()[:120])}[key])]
                 add("visibility", sev, f"Query terms missing from your {label}", f"Missing: {', '.join(miss)}. Top results cover {round(theirs * 100)}% of the terms there; you cover {round(mine * 100)}%.",
                     f"Work {', '.join(miss)} into the {label} where it reads naturally.", "search",
-                    "Extractors weigh title/H1/opening text most when deciding what a page answers.")
+                    "Extractors weigh title/H1/opening text most when deciding what a page answers.",
+                    confidence="likely", verify=f'curl -sL "{final_url}" | grep -i "{miss[0]}"')
 
         # Topic Gap Analysis
         if len(comps) >= 2:
@@ -1170,20 +1217,24 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
                 add("visibility", sev, "Topics the top pages cover that yours does not",
                     f"Topics missing: {', '.join(counts)}.",
-                    "Add sections covering these topics only where they genuinely apply to your content.", "search")
+                    "Add sections covering these topics only where they genuinely apply to your content.", "search",
+                    confidence="likely", verify=f'Compare "{final_url}" headings with competitors')
                 me["topic_gaps"] = gaps
 
         mw = median([c["words"] for c in comps])
         if mw and me["words"] < 0.5 * mw:
 
             add("visibility", "med", "Much thinner than the pages that outrank you", f"You: {me['words']} words. Median of top results: {mw}.",
-                "Cover the sub-questions those pages answer (see their H2s). Length itself is not the goal; coverage is.", "search")
+                "Cover the sub-questions those pages answer (see their H2s). Length itself is not the goal; coverage is.", "search",
+                confidence="likely", verify=f'curl -sL "{final_url}" | wc -w')
         if comps and sum(1 for c in comps if c["tables"] or c["lists"]) >= 2 and not (me["tables"] or me["lists"]):
             add("visibility", "low", "Competitors use lists/tables; you use neither", f"{sum(1 for c in comps if c['tables'])} of {len(comps)} have tables, {sum(1 for c in comps if c['lists'])} have lists.",
-                "Put comparable facts into a table or list; both are easy for AI tools to lift into an answer.", "search")
+                "Put comparable facts into a table or list; both are easy for AI tools to lift into an answer.", "search",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "<table|<ul|<ol"')
         dated = sum(1 for r in serp[:5] if r.get("date"))
         if is_article and dated >= 2 and not page.get("published_date"):
-            add("visibility", "med", "Top results show dates; your page exposes none", f"{dated} of the top 5 results carry a date in search.", "Expose a visible publish/updated date and mirror it in JSON-LD.", "search")
+            add("visibility", "med", "Top results show dates; your page exposes none", f"{dated} of the top 5 results carry a date in search.", "Expose a visible publish/updated date and mirror it in JSON-LD.", "search",
+                confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "date|published"')
 
     # =========================================================== scores (transparent heuristics)
     # Per-category breakdown
@@ -1288,6 +1339,15 @@ def to_markdown(r: dict) -> str:
             o.append("\n```json\n" + "\n".join(f["fix"].splitlines()[1:]) + "\n```")
         if f["ties"]:
             o.append(f"- **Why it hurts visibility:** {f['ties']}")
+        if f.get("confidence") or f.get("verify"):
+            conf = f.get("confidence", "")
+            ver = f.get("verify", "")
+            if conf and ver:
+                o.append(f"_Confidence: {conf} | Verify: {ver}_")
+            elif conf:
+                o.append(f"_Confidence: {conf}_")
+            elif ver:
+                o.append(f"_Verify: {ver}_")
         o.append("")
     o.append("## How this audit was produced\n")
     o.append("Every request below went to the live page or live search index (Fetch used `ttl=0`).\n")
