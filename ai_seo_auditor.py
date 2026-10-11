@@ -1243,9 +1243,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         penalty_sum = sum(PEN[f.sev] for f in F if f.area == area)
         cat_scores[area] = max(0, 100 - penalty_sum)
 
-    ai = max(0, 100 - sum(PEN[f.sev] for f in F if f.affects in ("ai", "both")))
-    base = 10 if rank is None else 95 if rank <= 3 else max(50, 80 - 3 * (rank - 4)) if rank <= 10 else 40
-    vis = max(0, base - sum(PEN[f.sev] for f in F if f.affects == "search") // 2)
+    if not readable:
+        ai = vis = None
+    else:
+        ai = max(0, 100 - sum(PEN[f.sev] for f in F if f.affects in ("ai", "both")))
+        base = 10 if rank is None else 95 if rank <= 3 else max(50, 80 - 3 * (rank - 4)) if rank <= 10 else 40
+        vis = max(0, base - sum(PEN[f.sev] for f in F if f.affects == "search") // 2)
     order = {"high": 0, "med": 1, "low": 2, "info": 3}
     F.sort(key=lambda f: order[f.sev])
 
