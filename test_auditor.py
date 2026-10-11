@@ -436,7 +436,7 @@ class Units(unittest.TestCase):
         titles = " | ".join(f["title"] for f in r["findings"])
         for expect in ("robots.txt blocks search crawlers", "only exists after JavaScript", "No structured data",
                        "Canonical points to a different URL", "images have no alt", "Query terms missing from your title",
-                       "Indexed, but not in the top", "Page not found in sitemap", "No llms.txt", "Article exposes no",
+                       "Returned by a domain-restricted TinyFish Search", "Page not found in sitemap", "No llms.txt", "Article exposes no",
                        "Heading levels skip"):
             self.assertIn(expect, titles)
         self.assertEqual(r["rank"], None)
@@ -458,7 +458,7 @@ class Units(unittest.TestCase):
                     return {}, {PAGE: {"url": PAGE, "error": "blocked", "status": 403}}
                 return super().fetch(urls, **kw)
         r = A.audit(PAGE, "best widgets", Blocked(), raw_fn=fake_raw)
-        self.assertEqual(r["findings"][0]["title"], "AI tools cannot extract any text from this page")
+        self.assertEqual(r["findings"][0]["title"], "TinyFish Fetch could not extract any readable text from this page")
         self.assertEqual(r["page"]["words"], 0)
         A.to_markdown(r)
 
@@ -694,7 +694,7 @@ class Units(unittest.TestCase):
 
         r_err = A.audit(PAGE, "best widgets", BlockedTF(), raw_fn=fake_raw)
         f_err = r_err["findings"][0]
-        self.assertEqual(f_err["title"], "AI tools cannot extract any text from this page")
+        self.assertEqual(f_err["title"], "TinyFish Fetch could not extract any readable text from this page")
         self.assertIn("TinyFish Fetch returned an error: forbidden (HTTP 403)", f_err["evidence"])
         self.assertEqual(f_err["confidence"], "likely")
 
@@ -708,7 +708,7 @@ class Units(unittest.TestCase):
 
         r_empty = A.audit(PAGE, "best widgets", EmptyTF(), raw_fn=fake_raw)
         f_empty = r_empty["findings"][0]
-        self.assertEqual(f_empty["title"], "AI tools cannot extract any text from this page")
+        self.assertEqual(f_empty["title"], "TinyFish Fetch could not extract any readable text from this page")
         self.assertEqual(f_empty["evidence"], "TinyFish Fetch returned an empty body.")
 
         # 3. Only N words extracted: conditional evidence reflecting exact count, not absolute "almost no text"
