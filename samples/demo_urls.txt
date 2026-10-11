@@ -1,0 +1,20 @@
+# REMINDER: Use public pages only. No personal data, no private URLs.
+# Leave placeholders (<URL>) and (<QUERY>) where not decided.
+
+# Client-rendered JavaScript-heavy site to test AI extraction
+<URL>, <QUERY>
+
+# WordPress / Medium-style blog post for readability and structure checks
+<URL>, <QUERY>
+
+# Documentation page — structured headings and tables expected
+<URL>, <QUERY>
+
+# Wikipedia article — dense reference content, clear H1
+<URL>, <QUERY>
+
+# Page targeting a clear query that should rank well
+<URL>, <QUERY>
+
+# Before/after case study entry
+https://ops-copilot-zeta.vercel.app, ai call quality

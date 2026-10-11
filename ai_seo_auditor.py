@@ -1360,6 +1360,44 @@ def to_markdown(r: dict) -> str:
     return "\n".join(o) + "\n"
 
 
+BATCH_DELAY = 3.0
+
+
+def safe_slug(host: str, path: str) -> str:
+    combined = (host + (path or "")).lower()
+    safe = re.sub(r"[^a-z0-9_.-]", "-", combined)
+    safe = re.sub(r"-+", "-", safe)
+    safe = safe.strip("-_.")
+    safe = safe[:200]
+    if not safe:
+        safe = "page"
+    reserved = {"con", "prn", "aux", "nul", "com1", "lpt1", "clock$", "nul"}
+    base = safe.split(".")[0] if "." in safe else safe
+    if base in reserved:
+        safe = base + "_"
+    for ch in ':?<>"|\\*':
+        safe = safe.replace(ch, "-")
+    safe = re.sub(r"[-_]+", "-", safe).strip("-")
+    return safe[:200] or "page"
+
+
+def parse_batch_lines(text: str):
+    lines = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "," in line:
+            url_part, query_part = line.split(",", 1)
+        else:
+            url_part, query_part = line, ""
+        url_part = url_part.strip()
+        query_part = query_part.strip()
+        if url_part:
+            lines.append((url_part, query_part or None))
+    return lines
+
+
 def load_dotenv(path: str = ".env") -> None:
     """Minimal .env reader (KEY=value lines). Real environment variables win over the file."""
     if not os.path.exists(path):
@@ -1380,6 +1418,8 @@ def main():
     ap.add_argument("-o", "--out", default="report", help="output prefix -> <out>.md and <out>.json")
     ap.add_argument("--country", help="country code for geo-targeted search, e.g. IN, US")
     ap.add_argument("--no-raw", action="store_true", help="skip the plain HTTP GET (no JSON-LD / JS-dependence checks)")
+    ap.add_argument("--batch", metavar="FILE", help="batch file with url[,query] lines; writes samples/<slug>.md + .json and samples/index.md")
+    ap.add_argument("--batch-delay", type=float, default=BATCH_DELAY, help="seconds between batch audits")
     ap.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
     ap.add_argument("--retries", type=int, default=RETRY_MAX_ATTEMPTS, help="Max retry attempts for API calls")
     a = ap.parse_args()
@@ -1392,6 +1432,69 @@ def main():
     key = os.environ.get("TINYFISH_API_KEY")
     if not key:
         sys.exit("Set TINYFISH_API_KEY (free at agent.tinyfish.ai/api-keys).")
+
+    if a.batch:
+        if not os.path.isfile(a.batch):
+            sys.stderr.write(f"Batch file not found: {a.batch}\n")
+            sys.exit(2)
+        with open(a.batch, "r", encoding="utf-8") as f:
+            batch_text = f.read()
+        entries = parse_batch_lines(batch_text)
+        if not entries:
+            sys.stderr.write("Batch file contained no valid URL lines.\n")
+            sys.exit(2)
+        tf = TinyFish(key, timeout=a.timeout, max_retries=a.retries)
+        results = []
+        for idx, (raw_url, query) in enumerate(entries, 1):
+            try:
+                url, note = normalize_target(raw_url)
+            except ValueError as ex:
+                sys.stderr.write(f"Batch item {idx}: {ex}\n")
+                results.append({"slug": "invalid", "url": raw_url, "query": query, "status": "invalid_url", "note": str(ex)})
+                if idx < len(entries):
+                    time.sleep(a.batch_delay)
+                continue
+            try:
+                res = audit(url, query, tf, do_raw=not a.no_raw, country=a.country, note=note)
+            except Exception as ex:
+                sys.stderr.write(f"Batch item {idx}: audit error: {str(ex).splitlines()[0]}\n")
+                res = {"status": "error", "url": url, "url_note": note, "findings": [{"title": str(ex)}], "query": query or ""}
+            p = urlparse(res.get("final_url") or url)
+            host = p.netloc.lower()
+            path = p.path or "/"
+            if urlparse(res.get("final_url") or url).query:
+                path += "?" + urlparse(res.get("final_url") or url).query
+            slug = safe_slug(host, path)
+            os.makedirs("samples", exist_ok=True)
+            md_path = os.path.join("samples", f"{slug}.md")
+            json_path = os.path.join("samples", f"{slug}.json")
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(to_markdown(res))
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(res, f, indent=2, default=str)
+            results.append({"slug": slug, "url": res.get("final_url") or url, "query": res.get("query") or query, "ai_readability": res.get("scores", {}).get("ai_readability"), "search_visibility": res.get("scores", {}).get("search_visibility"), "high": sum(1 for f in res.get("findings", []) if f.get("sev") == "high"), "med": sum(1 for f in res.get("findings", []) if f.get("sev") == "med"), "low": sum(1 for f in res.get("findings", []) if f.get("sev") == "low"), "status": res.get("status")})
+            if idx < len(entries):
+                time.sleep(a.batch_delay)
+        # Write index.md
+        index_lines = ["# Batch audit index\n", f"Run date: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC — audited live\n", ""]
+        index_lines.append("| Page | Query | AI readability | Search visibility | High / Med / Low | Report |")
+        index_lines.append("|---|---|---|---|---|---|")
+        for r in results:
+            page_name = r.get("url") or r.get("url", "")
+            query_name = r.get("query") or ""
+            ai = r.get("ai_readability")
+            vis = r.get("search_visibility")
+            ai_str = str(ai) if ai is not None else "—"
+            vis_str = str(vis) if vis is not None else "—"
+            counts = f"{r.get('high', 0)} / {r.get('med', 0)} / {r.get('low', 0)}"
+            link = f"[{r['slug']}.md](samples/{r['slug']}.md)"
+            index_lines.append(f"| {page_name} | {query_name} | {ai_str} | {vis_str} | {counts} | {link} |")
+        with open(os.path.join("samples", "index.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(index_lines) + "\n")
+        # Summary print
+        ok = sum(1 for r in results if r.get("status") not in ("error", "invalid_url"))
+        print(f"Batch complete: {ok}/{len(entries)} audited. Reports in samples/; index at samples/index.md")
+        return
 
     raw_url = a.url
     interactive = False

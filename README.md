@@ -41,6 +41,16 @@ One non-TinyFish call: a plain HTTP GET of the page. Fetch renders JavaScript an
 - Only `robots.txt` and meta/header directives are evaluated; WAF rules that block bots are not visible except when Fetch itself fails.
 - `llms.txt` is reported as low severity on purpose: no major engine documents it as a ranking signal.
 
+## Batch mode (`--batch FILE`)
+
+FILE is a text or CSV file with one `url[,query]` per line. Lines starting with `#` are comments; blank lines are ignored. If the query is omitted, it is derived from the page.
+
+```bash
+python ai_seo_auditor.py --batch urls.csv --batch-delay 3
+```
+
+Batch writes `samples/<slug>.md` and `.json` (slug derived from hostname + path, filesystem-safe), then `samples/index.md` with a table of results, counts, and links. It respects `--batch-delay` (default 3 s) and continues after per-URL errors. The API key is never written to any batch output.
+
 ## Tests
 
 `python -m unittest` runs offline checks with a fake client. The data is synthetic, shaped like real Fetch/Search responses; it verifies the logic, not the live API.
