@@ -2,4 +2,5 @@
 report*
 __pycache__/
 samples/regression/
-
+*claude*
+.claude/

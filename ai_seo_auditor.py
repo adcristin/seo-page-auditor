@@ -162,6 +162,10 @@ def norm(u: str) -> str:
     return host + (p.path.rstrip("/") or "") + (("?" + q) if q else "")
 
 
+def norm_query(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
 def normalize_target(raw: str) -> tuple[str, str | None]:
     """Normalize input URL and validate public web access.
 
@@ -870,7 +874,7 @@ def select_fix_first(findings: list[Finding]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- the audit
-def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = None, raw_fn=None, note: str | None = None) -> dict:
+def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = None, language: str | None = None, raw_fn=None, note: str | None = None) -> dict:
     raw_fn = raw_fn or raw_view
     F: list[Finding] = []
 
@@ -882,6 +886,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
     p = urlparse(url)
     host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
+    brand_token = host.split(".")[0]
 
     # ---- FETCH 1: the page as an AI tool extracts it (rendered, live)
     http_fallback_used = False
@@ -1067,23 +1072,104 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     elif sm_found is None:
         sm_found = False
 
-    # ---- SEARCH: does the page surface for the query?
-    serp, rank, entry = [], None, None
+    # ---- SEARCH: up to three visibility queries (target, topic, brand)
+    def query_params(extra=None):
+        d = {"location": country} if country else {}
+        if language:
+            d["language"] = language
+        if extra:
+            d.update(extra)
+        return d
+
+    # Derive queries
+    target_query = query or ""
+    brand_query = brand_token
+    # Topic: from title/H1 with brand token removed
+    topic_raw = (h1 or title or "").strip()
+    topic_tokens = [t for t in tokens(topic_raw) if t != brand_token and t not in STOP]
+    topic_query = " ".join(topic_tokens) if topic_tokens else (h1 or title or "")
+    # Skip rules
+    skip_topic = norm_query(topic_query) == norm_query(target_query)
+    skip_brand = norm_query(brand_query) == norm_query(target_query)
+
+    visibility = {}
+    # (a) target query
+    target_serp, target_rank, target_entry = [], None, None
     try:
+        target_pages = 2  # pages 0-2 -> up to 3 pages? Actually page range 3 means 0,1,2
         for pg in range(3):
-            batch = tf.search(query, page=pg, **({"location": country} if country else {}))
-            serp += batch
+            batch = tf.search(target_query, page=pg, **query_params())
+            # Record call with filter info
+            filter_used = "none"
+            tf.calls[-1] = (tf.calls[-1][0], f"{target_query} (page {pg}; domain_filter={filter_used})")
+            target_serp += batch
             for i, r in enumerate(batch, 1):
                 if norm(r["url"]) in keys:
-                    rank, entry = pg * len(batch) + i, r
+                    target_rank, target_entry = pg * len(batch) + i, r
                     break
-            if rank or not batch:
+            if target_rank or not batch:
                 break
     except (requests.RequestException, Exception) as ex:
         add("visibility", "low", "Search unavailable, visibility not measured",
             f"The TinyFish Search API returned a persistent error: {str(ex).splitlines()[0]}.",
             "No action needed; re-run the audit later.", "search",
             confidence="unverified", verify="curl -sI https://api.search.tinyfish.ai/")
+
+    # (b) topic query
+    topic_serp, topic_rank, topic_entry = [], None, None
+    if not skip_topic:
+        try:
+            for pg in range(2):  # pages 0-1
+                batch = tf.search(topic_query, page=pg, **query_params())
+                tf.calls[-1] = (tf.calls[-1][0], f"{topic_query} (page {pg}; domain_filter={filter_used})")
+                topic_serp += batch
+                for i, r in enumerate(batch, 1):
+                    if norm(r["url"]) in keys:
+                        topic_rank, topic_entry = pg * len(batch) + i, r
+                        break
+                if topic_rank or not batch:
+                    break
+        except (requests.RequestException, Exception):
+            pass  # ignore errors for secondary queries
+    else:
+        topic_serp, topic_rank, topic_entry = [], None, None
+
+    # (c) brand query
+    brand_serp, brand_rank, brand_entry = [], None, None
+    if not skip_brand:
+        try:
+            for pg in range(2):
+                batch = tf.search(brand_query, page=pg, **query_params())
+                tf.calls[-1] = (tf.calls[-1][0], f"{brand_query} (page {pg}; domain_filter={filter_used})")
+                brand_serp += batch
+                for i, r in enumerate(batch, 1):
+                    if norm(r["url"]) in keys:
+                        brand_rank, brand_entry = pg * len(batch) + i, r
+                        break
+                if brand_rank or not batch:
+                    break
+        except (requests.RequestException, Exception):
+            pass
+    else:
+        brand_serp, brand_rank, brand_entry = [], None, None
+
+    # Domain-restricted diagnostic with include_domains instead of site:
+    own, own_entry = [], None
+    if target_rank is None:
+        try:
+            own = tf.search(target_query, include_domains=host, **query_params({}))
+            tf.calls[-1] = (tf.calls[-1][0], f"{target_query} (domain_filter=include_domains:{host})")
+            own_entry = next((r for r in own if norm(r["url"]) in keys), None)
+        except (requests.RequestException, Exception):
+            pass
+
+    # Set aliases for backward compatibility
+    serp = target_serp
+    rank = target_rank
+    entry = target_entry
+    seen = entry or own_entry
+    if seen:
+        seen = {**seen, "title": clean(seen.get("title")), "snippet": tidy_snippet(seen.get("snippet"))}
 
     # Note in report if CJK fallback was used
     if is_cjk(md):
@@ -1092,16 +1178,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             "No action needed.", "ai",
             confidence="verified", verify=f'curl -sL "{final_url}" | head -n 30')
 
-    own, own_entry = [], None
-    if rank is None:  # diagnostic: is the page returned by a domain-restricted TinyFish Search?
-        try:
-            own = tf.search(f"site:{host} {' '.join(tokens(h1 or title)[:8])}")
-            own_entry = next((r for r in own if norm(r["url"]) in keys), None)
-        except (requests.RequestException, Exception):
-            pass
-    seen = entry or own_entry
-    if seen:
-        seen = {**seen, "title": clean(seen.get("title")), "snippet": tidy_snippet(seen.get("snippet"))}
+    # Record visibility results
+    visibility = {
+        "target": {"rank": target_rank, "serp": target_serp, "entry": target_entry},
+        "topic": {"rank": topic_rank, "serp": topic_serp, "entry": topic_entry},
+        "brand": {"rank": brand_rank, "serp": brand_serp, "entry": brand_entry},
+    }
 
     # ---- competitors: fetch the pages that outrank us and profile them the same way
     cand = [(i, r) for i, r in enumerate(serp, 1) if norm(r["url"]).split("/")[0] != norm(url).split("/")[0]][:6]
@@ -1377,12 +1459,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     if rank is None:
         if own_entry:
             add("visibility", "med" if readable and not any(blocked.get(b) for b in BOTS) else "high", f"Returned by a domain-restricted TinyFish Search, but not in the top {len(serp)} results for this query (observed at {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)",
-                f"Returned by a TinyFish domain-restricted search (site:{host}) as \"{own_entry['title']}\" (observed at {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC), but not returned in the top {len(serp)} results of this observation for \"{query}\".",
+                f"Returned by a TinyFish domain-restricted search (include_domains:{host}) as \"{own_entry['title']}\" (observed at {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC), but not returned in the top {len(serp)} results of this observation for \"{query}\".",
                 "This observation shows the page is returned by a domain-restricted TinyFish Search but does not rank in the top results for this query. Compare with the pages above for structural differences.", "search",
                 confidence="likely", verify=f'Search for "{query}" on Google or Bing')
         else:
             add("visibility", "high" if not readable or any(blocked.get(b) for b in BOTS) else "med", "Not returned in the top results for a domain-restricted TinyFish Search",
-                f"Not returned by TinyFish Search for \"{query}\" (top {len(serp)} results checked at {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC) or for a domain-restricted search (site:{host}). This does not show it is absent from other search engines.",
+                f"Not returned by TinyFish Search for \"{query}\" (top {len(serp)} results checked at {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC) or for a domain-restricted search (include_domains:{host}). This does not show it is absent from other search engines.",
                 "Check noindex, canonical, robots.txt, sitemap and internal links; then consider requesting indexing in Search Console or Bing Webmaster Tools (this observation is only for TinyFish Search).", "both",
                 "Typical effect: if a page is not returned by this observed search set, it is unlikely to appear in answers drawn from this source; other engines may still include it.",
                 confidence="likely", verify=f'Search "site:{host}" on Google or Bing')
@@ -1443,6 +1525,35 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
             add("visibility", "med", "Top results show dates; your page exposes none", f"{dated} of the top 5 results carry a date in search.", "Expose a visible publish/updated date and mirror it in JSON-LD.", "search",
                 confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "date|published"')
 
+    # ---- New visibility observations using observed positions only
+    # Found for brand but not target/topic
+    if readable:
+        if brand_rank is not None and target_rank is None and not skip_brand:
+            add("visibility", "med", "Found for the brand name but not for what the page is about",
+                f"The page appears in brand results (rank {brand_rank}) but is not observed in the top results for the target query.",
+                "Review whether the page's content clearly addresses the target topic; align title/H1 and opening text with it.", "search",
+                confidence="likely", verify=f'Search for "{brand_query}" and "{target_query}"')
+        # Another page of same host returned for target query
+        same_host_target = [r for r in target_serp if host in r.get("url", "") and norm(r.get("url", "")) not in keys]
+        if same_host_target:
+            urls_named = ", ".join(r.get("url", "") for r in same_host_target[:3])
+            add("visibility", "med", "Another page of the same host is returned for the target query",
+                f"Returned instead: {urls_named}.",
+                "Check internal links and canonical settings so the intended page is preferred for this query.", "search",
+                confidence="likely", verify=f'Search "{target_query}"')
+        # Possible name overlap on other domains (title contains brand token)
+        overlap = []
+        for r in target_serp:
+            url_host = urlparse(r.get("url", "")).netloc.lower()
+            if url_host and url_host != host and brand_token in (r.get("title", "") or "").lower():
+                overlap.append(r.get("url", ""))
+        if overlap:
+            overlap_list = ", ".join(overlap[:3])
+            add("visibility", "info", "Possible name overlap",
+                f"Results on other domains whose title contains '{brand_token}': {overlap_list}.",
+                "No assertion about ownership; just note potential name overlap.", "search",
+                confidence="likely", verify=f'Search "{target_query}"')
+
     # =========================================================== scores (transparent heuristics)
     # Per-category breakdown
     cat_scores = {}
@@ -1462,8 +1573,9 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     fix_first_titles = select_fix_first(F)
 
     return {
+        "visibility": visibility,
         "url": url, "final_url": final_url, "url_note": url_note, "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "query": query, "query_source": query_src, "country": country, "rank": rank, "serp_entry": seen, "serp_size": len(serp),
+        "query": query, "query_source": query_src, "country": country, "language": language, "rank": rank, "serp_entry": seen, "serp_size": len(serp),
         "scores": {"ai_readability": ai, "search_visibility": vis},
         "page": {**me, "title": title, "description": desc, "description_source": desc_src, "canonical": meta.get("canonical"),
                  "robots": tags.strip(), "images": len(images), "images_missing_alt": len([i for i in images if i["alt"] is None and not i["decorative"]]),
@@ -1641,6 +1753,7 @@ def main():
     ap.add_argument("-q", "--query", help="target search query (derived from the page if omitted)")
     ap.add_argument("-o", "--out", default="report", help="output prefix -> <out>.md and <out>.json")
     ap.add_argument("--country", help="country code for geo-targeted search, e.g. IN, US")
+    ap.add_argument("--language", help="language code for result language, e.g. en, fr, de")
     ap.add_argument("--no-raw", action="store_true", help="skip the plain HTTP GET (no JSON-LD / JS-dependence checks)")
     ap.add_argument("--batch", metavar="FILE", help="batch file with url[,query] lines; writes samples/<slug>.md + .json and samples/index.md")
     ap.add_argument("--batch-delay", type=float, default=BATCH_DELAY, help="seconds between batch audits")
@@ -1681,7 +1794,7 @@ def main():
                     time.sleep(a.batch_delay)
                 continue
             try:
-                res = audit(url, query, tf, do_raw=not a.no_raw, country=a.country, note=note)
+                res = audit(url, query, tf, do_raw=not a.no_raw, country=a.country, language=a.language, note=note)
             except Exception as ex:
                 msg = redact(str(ex).splitlines()[0])
                 sys.stderr.write(redact(f"Batch item {idx}: audit error: {msg}\n"))
@@ -1765,7 +1878,7 @@ def main():
         sys.exit(1)
 
     try:
-        res = audit(url, query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country, note=note)
+        res = audit(url, query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country, language=a.language, note=note)
     except (requests.RequestException, Exception) as ex:
         msg = redact(str(ex).splitlines()[0])
         sys.stderr.write(redact(f"Error: {msg} (Exit code 2)\n"))

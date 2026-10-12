@@ -79,6 +79,8 @@ class FakeTF:
 
     def search(self, query, page=0, **kw):
         self.calls.append(("search", query))
+        if kw.get("include_domains"):
+            return [{"position": 1, "url": PAGE, "title": "Best widgets guide", "snippet": "x"}]
         if query.startswith("site:"):
             return [{"position": 1, "url": PAGE, "title": "Best widgets guide", "snippet": "x"}]
         if page:
