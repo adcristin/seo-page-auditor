@@ -27,6 +27,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qsl, urlencode
 
 import requests
+import socket
 
 SEARCH_URL = "https://api.search.tinyfish.ai"
 FETCH_URL = "https://api.fetch.tinyfish.ai"
@@ -46,6 +47,36 @@ BOTS = {
 }
 STOP = set("a an and are as at be by for from how in is it of on or that the to what when where which who why with your you".split())
 PEN = {"high": 15, "med": 7, "low": 3, "info": 0}
+
+# --------------------------------------------------------------------------- redaction
+API_KEY_VALUE = os.environ.get("TINYFISH_API_KEY", "")
+
+KEY_PATTERNS = [
+    re.compile(r"sk-[a-zA-Z0-9]{20,}"),
+    re.compile(r"X-API-Key[:\s=]+[a-zA-Z0-9_\-]+", re.I),
+]
+
+
+def redact(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    # Remove configured API key value
+    if API_KEY_VALUE:
+        text = text.replace(API_KEY_VALUE, "[REDACTED_KEY]")
+    # Remove patterns that look like secrets
+    for pat in KEY_PATTERNS:
+        text = pat.sub("[REDACTED_KEY]", text)
+    return text
+
+
+def redact_value(value):
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: redact_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(v) for v in value]
+    return value
 
 
 # --------------------------------------------------------------------------- TinyFish client
@@ -185,6 +216,17 @@ def normalize_target(raw: str) -> tuple[str, str | None]:
     if not host_str:
         raise ValueError("That doesn't look like a URL")
 
+    # Reject embedded credentials
+    if p.username or p.password:
+        raise ValueError("URLs with embedded credentials (user:pass@) are not allowed.")
+
+    # Reject query strings that look like they carry secrets
+    query_lower = p.query.lower()
+    secret_query_keys = ["token", "key", "signature", "password"]
+    for k, v in parse_qsl(p.query):
+        if k.lower() in secret_query_keys:
+            raise ValueError(f"Query parameter '{k}' suggests a secret; URLs with query secrets are not allowed.")
+
     # Check localhost
     if host_str.lower() == "localhost":
         raise ValueError("TinyFish requires public web URLs; 'localhost' is not accessible.")
@@ -211,14 +253,8 @@ def normalize_target(raw: str) -> tuple[str, str | None]:
     except UnicodeError:
         raise ValueError("That doesn't look like a URL")
 
-    # 5. Reconstruct normalized URL
-    netloc_parts = []
-    if p.username:
-        userinfo = p.username
-        if p.password:
-            userinfo += f":{p.password}"
-        netloc_parts.append(f"{userinfo}@")
-    netloc_parts.append(ascii_host)
+    # 5. Reconstruct normalized URL (no userinfo allowed)
+    netloc_parts = [ascii_host]
     if p.port:
         netloc_parts.append(f":{p.port}")
     new_netloc = "".join(netloc_parts)
@@ -525,6 +561,7 @@ class Outline(HTMLParser):
             self._h = None
 
 
+# Keep nav/footer text; skip script/style/noscript/template/svg
 class RawPage(HTMLParser):
     """What a crawler that does NOT run JavaScript sees in the first HTML response."""
     SKIP = {"script", "style", "noscript", "template", "svg"}
@@ -565,10 +602,77 @@ class RawPage(HTMLParser):
             self.text.append(d)
 
 
+def _is_safe_host(hostname: str) -> bool:
+    try:
+        info = socket.getaddrinfo(hostname, None)
+        for _, _, _, _, sockaddr in info:
+            ip_str = sockaddr[0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+            if ip.is_private:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+CLOUD_METADATA_IPS = {
+    "169.254.169.254", "fe80::a9fe:a9fe",
+}
+
+
 def raw_view(url: str) -> dict:
     """Plain HTTP GET. Not a TinyFish call: Fetch renders JS and hides <script> tags, so this is
     the only way to see JSON-LD and to measure how much text depends on JavaScript."""
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=25, stream=True)
+    # Resolve and validate host before connecting (SSRF protection)
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Invalid URL for raw GET: no hostname.")
+    # Resolve hostname
+    try:
+        info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve hostname '{hostname}': {exc}")
+    # Refuse private, loopback, link-local, reserved, multicast, cloud metadata
+    for _, _, _, _, sockaddr in info:
+        ip_str = sockaddr[0]
+        ip = ipaddress.ip_address(ip_str)
+        if ip_str in CLOUD_METADATA_IPS or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_private:
+            raise ValueError(f"Host '{hostname}' resolves to disallowed IP '{ip_str}'.")
+
+    max_hops = 5
+    total_start = time.time()
+    # Follow redirects manually (max 5 hops) and apply same IP check to each hop
+    current_url = url
+    for hop in range(max_hops + 1):
+        if time.time() - total_start > 25:
+            raise ValueError("Raw GET exceeded total time limit (25s).")
+        r = requests.get(current_url, headers={"User-Agent": UA}, timeout=25, stream=True, allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location")
+            if not loc:
+                raise ValueError("Redirect response missing Location header.")
+            # Resolve redirect target before following
+            redirect_parsed = urlparse(loc)
+            redirect_host = redirect_parsed.hostname or urlparse(current_url).hostname
+            try:
+                redirect_info = socket.getaddrinfo(redirect_host, None)
+            except socket.gaierror as exc:
+                raise ValueError(f"Cannot resolve redirect host '{redirect_host}': {exc}")
+            for _, _, _, _, sockaddr in redirect_info:
+                redirect_ip_str = sockaddr[0]
+                redirect_ip = ipaddress.ip_address(redirect_ip_str)
+                if redirect_ip_str in CLOUD_METADATA_IPS or redirect_ip.is_loopback or redirect_ip.is_link_local or redirect_ip.is_reserved or redirect_ip.is_multicast or redirect_ip.is_private:
+                    raise ValueError(f"Redirect to disallowed IP '{redirect_ip_str}' refused.")
+            # Resolve relative URLs
+            current_url = requests.compat.urljoin(current_url, loc)
+            continue
+        # Final response (not redirect)
+        break
+    else:
+        raise ValueError("Too many redirects (max 5) during raw GET.")
 
     content_type = r.headers.get("Content-Type", "").lower()
     is_html = "text/html" in content_type or "application/xhtml+xml" in content_type
@@ -650,6 +754,39 @@ def coverage(rendered_md: str, raw_text: str, n=12, w=8):
     hay = "".join(tokens(raw_text))  # spacing-insensitive on both sides
     missing = [" ".join(x) for x in wins if "".join(x) not in hay]
     return 1 - len(missing) / len(wins), missing
+
+
+def shingle_words(text: str, n=5) -> set[str]:
+    toks = tokens(text)
+    return set(" ".join(toks[i:i+n]) for i in range(len(toks)-n+1)) if len(toks) >= n else set()
+
+
+def extraction_retention(raw_text: str, md_text: str) -> float | None:
+    if not raw_text or not md_text:
+        return None
+    raw_shingles = shingle_words(raw_text, 5)
+    if not raw_shingles:
+        return None
+    md_shingles = shingle_words(md_text, 5)
+    common = raw_shingles & md_shingles
+    return len(common) / len(raw_shingles)
+
+
+def headings_lost(dom_heads: list[tuple[int, str]], md_text: str) -> list[str]:
+    md_heads = [t for l, t in md_stats(md_text)[0] if l in (1, 2, 3)]
+    md_set = {clean(h) for h in md_heads}
+    lost = []
+    for lvl, t in dom_heads:
+        if lvl in (1, 2, 3) and clean(t) not in md_set:
+            lost.append(clean(t))
+    # dedupe preserving order
+    seen = set()
+    unique_lost = []
+    for h in lost:
+        if h not in seen:
+            seen.add(h)
+            unique_lost.append(h)
+    return unique_lost[:5]
 
 
 # --------------------------------------------------------------------------- search-side helpers
@@ -862,6 +999,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
     # ---- raw GET (supplement): JSON-LD, meta description, X-Robots-Tag, JS dependence
     raw, raw_err = None, None
+    parity = {"js_only_pct": None, "extraction_retention_pct": None, "headings_lost": []}
     if do_raw:
         try:
             raw = raw_fn(final_url)
@@ -1072,7 +1210,66 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 confidence="likely", verify=f'curl -sL "{final_url}" | wc -w')
 
         if raw and not raw.get("non_html"):
+            # Skip rules: non-HTML handled by non_html; challenge pages skipped below.
+            raw_words = len(re.findall(r"\w+", raw["text"] or ""))
+            is_challenge = looks_like_challenge(title, md, count_words(md))
+            skip_parity = raw_words < 100 or is_challenge or raw.get("non_html")
+            # Note: non-HTML already excluded from this branch; skip_parity covers <100 words and challenge.
+            if not skip_parity:
+                ret = extraction_retention(raw["text"], md)
+                if ret is not None and ret < 0.5 and raw_words >= 300:
+                    # Find missing passages (use raw shingles that are missing from md as examples)
+                    raw_shingles = shingle_words(raw["text"], 5)
+                    md_shingles = shingle_words(md, 5)
+                    missing_shingles = sorted(raw_shingles - md_shingles)
+                    # Build 3 example passages (12 words each) from raw text not present in md
+                    passages = []
+                    toks = tokens(raw["text"])
+                    for i in range(0, len(toks)-12, 3):
+                        passage = " ".join(toks[i:i+12])
+                        if clean(passage) not in md:
+                            passages.append(passage)
+                        if len(passages) >= 3:
+                            break
+                    examples = passages[:3]
+                    ev = f"AI extraction keeps only about {round(ret*100)}% of the text in the page's HTML"
+                    evidence_str = ev + ". Evidence: " + "; ".join(f'"{ex}"' for ex in examples)
+                    add("content", "med", "AI extraction keeps only a fraction of the HTML text",
+                        evidence_str,
+                        "Ensure the main content is in the static HTML, not injected after load.", "both",
+                        "Some crawlers read only raw HTML, so text missing from it may not be observed. This does not prove exclusion from any index.",
+                        confidence="likely", verify=f'curl -sL "{final_url}" | wc -w')
+                # Headings lost
+                lost_heads = headings_lost(dom_heads, md)
+                if lost_heads:
+                    add("content", "low", "Headings lost in AI extraction", f"H1-H3 headings present in the raw HTML but missing from the Fetch markdown: {', '.join(lost_heads[:5])}.",
+                        "Keep headings in plain HTML so extractors see them.", "ai",
+                        "Headings guide extractors; lost headings mean topic structure is invisible.",
+                        confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "<h[1-3]"')
+            # Compute parity regardless of skip for JSON/table
+            raw_words = len(re.findall(r"\w+", raw["text"] or ""))
+            ret_val = extraction_retention(raw["text"], md) if (raw_words >= 100 and not is_challenge) else None
+            lost_heads = headings_lost(dom_heads, md) if (raw_words >= 100 and not is_challenge) else []
+            parity = {
+                "js_only_pct": round((1 - (cov if ('cov' in locals() and cov is not None) else 1)) * 100) if 'cov' in locals() else None,
+                "extraction_retention_pct": round(ret_val * 100) if ret_val is not None else None,
+                "headings_lost": lost_heads,
+            }
+            # Actually compute js_only_pct properly
+            # Re-calculate coverage for parity if needed
+            # We'll set it after coverage is computed.
+        else:
+            ret_val = None
+            lost_heads = []
+            parity = {"js_only_pct": None, "extraction_retention_pct": None, "headings_lost": []}
+
+        # Re-calc coverage for parity (only when raw exists)
+        if raw and not raw.get("non_html"):
             cov, miss = coverage(md, raw["text"])
+            if 'parity' not in locals():
+                parity = {"js_only_pct": None, "extraction_retention_pct": None, "headings_lost": []}
+            js_only = round((1 - cov) * 100) if cov is not None else None
+            # Original JS-dependence finding (only once)
             if cov is not None and cov < 0.85:
                 sev = "high" if cov < 0.5 else "med"
                 add("content", sev, "Much of the text only exists after JavaScript runs",
@@ -1080,6 +1277,16 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                     "Server-side render or statically generate the main content (SSR/SSG). Verify with `curl -s URL | grep -i 'a phrase from the page'`.", "both",
                     "Typical effect: some crawlers read only raw HTML, so text that requires JavaScript may not be observed by them. This is not proof that the page is excluded from any index.",
                     confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "{miss[0][:30]}"')
+            # Skip rules for retention/headings
+            raw_words = len(re.findall(r"\w+", raw["text"] or ""))
+            is_challenge = looks_like_challenge(title, md, count_words(md))
+            skip_parity = raw_words < 100 or is_challenge
+            ret_val = extraction_retention(raw["text"], md) if (not skip_parity) else None
+            lost_heads = headings_lost(dom_heads, md) if (not skip_parity) else []
+            parity["js_only_pct"] = js_only
+            parity["extraction_retention_pct"] = round(ret_val * 100) if ret_val is not None else None
+            parity["headings_lost"] = lost_heads
+            # JSON-LD checks (original)
             if not raw["jsonld"]:
                 add("content", "med", "No structured data (JSON-LD)", "No application/ld+json block in the raw HTML.",
                     "Add JSON-LD. Starter based on what Fetch extracted:\n" + jsonld_skeleton(me, desc, meta, final_url,
@@ -1265,6 +1472,7 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         "site": {"robots_txt": bool(robots_txt), "llms_txt": bool(llms_txt), "in_sitemap": sm_found, "blocked_bots": [b for b, v in blocked.items() if v]},
         "competitors": comps, "competitor_errors": comp_err, "findings": [asdict(f) for f in F], "fix_first": fix_first_titles, "calls": tf.calls,
         "category_scores": cat_scores, "topic_gaps": me.get("topic_gaps", []),
+        "parity": parity,
     }
 
 
@@ -1351,6 +1559,13 @@ def to_markdown(r: dict) -> str:
                 o.append(f"_Confidence: {conf}_")
             elif ver:
                 o.append(f"_Verify: {ver}_")
+        # Parity table next to JS-dependence finding
+        if f.get("title") == "Much of the text only exists after JavaScript runs":
+            p = r.get("parity", {})
+            o.append("\n**Parity:** | Metric | Value |\n|---|---|\n")
+            o.append(f"| JS-only % | {p.get('js_only_pct', 'n/a')}% |")
+            o.append(f"| Extraction retention | {p.get('extraction_retention_pct', 'n/a')}% |")
+            o.append(f"| Headings lost | {', '.join(p.get('headings_lost', [])) or 'none'} |")
         o.append("")
     o.append("## What this audit did not check\n")
     o.append("- Backlinks / referring domains\n")
@@ -1419,7 +1634,8 @@ def load_dotenv(path: str = ".env") -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Exit codes: 0 complete observation, 1 input/config error, 2 partial or unavailable (page unreadable, search failed)
+    ap = argparse.ArgumentParser(description=__doc__ + "\n\nExit codes: 0 complete observation, 1 input/config error, 2 partial/unavailable (page unreadable, search failed).", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url", nargs="?", help="URL to audit")
     ap.add_argument("query_words", nargs="*", help="target search query words (if -q is omitted)")
     ap.add_argument("-q", "--query", help="target search query (derived from the page if omitted)")
@@ -1439,25 +1655,27 @@ def main():
     load_dotenv()
     key = os.environ.get("TINYFISH_API_KEY")
     if not key:
-        sys.exit("Set TINYFISH_API_KEY (free at agent.tinyfish.ai/api-keys).")
+        sys.stderr.write(redact("Set TINYFISH_API_KEY (free at agent.tinyfish.ai/api-keys)."))
+        sys.exit(1)
 
     if a.batch:
         if not os.path.isfile(a.batch):
-            sys.stderr.write(f"Batch file not found: {a.batch}\n")
-            sys.exit(2)
+            sys.stderr.write(redact(f"Batch file not found: {a.batch}\n"))
+            sys.exit(1)
         with open(a.batch, "r", encoding="utf-8") as f:
             batch_text = f.read()
         entries = parse_batch_lines(batch_text)
         if not entries:
-            sys.stderr.write("Batch file contained no valid URL lines.\n")
-            sys.exit(2)
+            sys.stderr.write(redact("Batch file contained no valid URL lines.\n"))
+            sys.exit(1)
         tf = TinyFish(key, timeout=a.timeout, max_retries=a.retries)
         results = []
         for idx, (raw_url, query) in enumerate(entries, 1):
             try:
                 url, note = normalize_target(raw_url)
             except ValueError as ex:
-                sys.stderr.write(f"Batch item {idx}: {ex}\n")
+                msg = redact(str(ex))
+                sys.stderr.write(redact(f"Batch item {idx}: {msg}\n"))
                 results.append({"slug": "invalid", "url": raw_url, "query": query, "status": "invalid_url", "note": str(ex)})
                 if idx < len(entries):
                     time.sleep(a.batch_delay)
@@ -1465,8 +1683,9 @@ def main():
             try:
                 res = audit(url, query, tf, do_raw=not a.no_raw, country=a.country, note=note)
             except Exception as ex:
-                sys.stderr.write(f"Batch item {idx}: audit error: {str(ex).splitlines()[0]}\n")
-                res = {"status": "error", "url": url, "url_note": note, "findings": [{"title": str(ex)}], "query": query or ""}
+                msg = redact(str(ex).splitlines()[0])
+                sys.stderr.write(redact(f"Batch item {idx}: audit error: {msg}\n"))
+                res = {"status": "error", "url": url, "url_note": note, "findings": [{"title": msg}], "query": query or ""}
             p = urlparse(res.get("final_url") or url)
             host = p.netloc.lower()
             path = p.path or "/"
@@ -1476,10 +1695,19 @@ def main():
             os.makedirs("samples", exist_ok=True)
             md_path = os.path.join("samples", f"{slug}.md")
             json_path = os.path.join("samples", f"{slug}.json")
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(to_markdown(res))
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(res, f, indent=2, default=str)
+            # Never overwrite existing reports
+            def safe_path(path, suffix=""):
+                if not os.path.exists(path):
+                    return path
+                ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+                base, ext = os.path.splitext(path)
+                return base + "_" + ts + (suffix or ext)
+            md_path_final = safe_path(md_path)
+            json_path_final = safe_path(json_path)
+            with open(md_path_final, "w", encoding="utf-8") as f:
+                f.write(redact(to_markdown(res)))
+            with open(json_path_final, "w", encoding="utf-8") as f:
+                f.write(json.dumps(redact_value(res), indent=2, default=str))
             results.append({"slug": slug, "url": res.get("final_url") or url, "query": res.get("query") or query, "ai_readability": res.get("scores", {}).get("ai_readability"), "search_visibility": res.get("scores", {}).get("search_visibility"), "high": sum(1 for f in res.get("findings", []) if f.get("sev") == "high"), "med": sum(1 for f in res.get("findings", []) if f.get("sev") == "med"), "low": sum(1 for f in res.get("findings", []) if f.get("sev") == "low"), "status": res.get("status")})
             if idx < len(entries):
                 time.sleep(a.batch_delay)
@@ -1532,31 +1760,49 @@ def main():
     try:
         url, note = normalize_target(raw_url)
     except ValueError as ex:
-        sys.stderr.write(f"Error: {ex}\n")
-        sys.exit(2)
+        msg = redact(str(ex))
+        sys.stderr.write(redact(f"Error: {msg}\n"))
+        sys.exit(1)
 
     try:
         res = audit(url, query, TinyFish(key, timeout=a.timeout, max_retries=a.retries), do_raw=not a.no_raw, country=a.country, note=note)
     except (requests.RequestException, Exception) as ex:
-        sys.stderr.write(f"Error: {str(ex).splitlines()[0]} (Exit code 2)\n")
+        msg = redact(str(ex).splitlines()[0])
+        sys.stderr.write(redact(f"Error: {msg} (Exit code 2)\n"))
         sys.exit(2)
-    with open(a.out + ".md", "w", encoding="utf-8") as f:
-        f.write(to_markdown(res))
-    with open(a.out + ".json", "w", encoding="utf-8") as f:
-        json.dump(res, f, indent=2, default=str)
+    md_path = a.out + ".md"
+    json_path = a.out + ".json"
+    def safe_path(path):
+        if not os.path.exists(path):
+            return path
+        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        base, ext = os.path.splitext(path)
+        return base + "_" + ts + ext
+    md_path_final = safe_path(md_path)
+    json_path_final = safe_path(json_path)
+    with open(md_path_final, "w", encoding="utf-8") as f:
+        f.write(redact(to_markdown(res)))
+    with open(json_path_final, "w", encoding="utf-8") as f:
+        f.write(json.dumps(redact_value(res), indent=2, default=str))
+    final_path_md = md_path_final
+    final_path_json = json_path_final
     if res.get("status") == "not_found":
-        print(f"NOT AUDITABLE: {res['findings'][0]['title']} - {res['url']}")
-        print(f"wrote {a.out}.md and {a.out}.json")
-        return
+        msg = redact(str(res['findings'][0]['title']))
+        print(redact(f"NOT AUDITABLE: {msg} - {res['url']}"))
+        print(redact(f"wrote {final_path_md} and {final_path_json}"))
+        sys.exit(2)
     if res.get("status") == "error":
-        print(f"AUDIT ERROR: {res['findings'][0]['title']} - {res['url']}")
-        print(f"wrote {a.out}.md and {a.out}.json")
-        return
+        msg = redact(str(res['findings'][0]['title']))
+        print(redact(f"AUDIT ERROR: {msg} - {res['url']}"))
+        print(redact(f"wrote {final_path_md} and {final_path_json}"))
+        sys.exit(2)
     s = res["scores"]
-    print(f"AI readability {s['ai_readability']}/100 | visibility {s['search_visibility']}/100 | rank {res['rank'] or 'not found'} for \"{res['query']}\"")
+    msg = redact(f"AI readability {s['ai_readability']}/100 | visibility {s['search_visibility']}/100 | rank {res['rank'] or 'not found'} for \"{res['query']}\"")
+    print(msg)
     for f in res["findings"][:5]:
-        print(f"  [{f['sev']}] {f['title']}")
-    print(f"wrote {a.out}.md and {a.out}.json")
+        print(redact(f"  [{f['sev']}] {f['title']}"))
+    print(redact(f"wrote {final_path_md} and {final_path_json}"))
+    return
 
 
 if __name__ == "__main__":

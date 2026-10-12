@@ -41,6 +41,22 @@ One non-TinyFish call: a plain HTTP GET of the page. Fetch renders JavaScript an
 - Only `robots.txt` and meta/header directives are evaluated; WAF rules that block bots are not visible except when Fetch itself fails.
 - `llms.txt` is reported as low severity on purpose: no major engine documents it as a ranking signal.
 
+## Exit codes
+
+- `0` — complete observation (audit finished, report written).
+- `1` — input/config error (bad URL, missing API key, unsupported scheme, batch file missing, embedded credentials, query secrets, etc.).
+- `2` — partial or unavailable (page unreadable, search failed, 404, redirect loop exceeded, raw GET blocked by SSRF check).
+
+These are documented in `--help` and used by `sys.exit`.
+
+## Security / SSRF protections
+
+- `raw_view()` resolves hostnames before connecting and refuses private, loopback, link-local, reserved, multicast, and cloud-metadata IPs (IPv4 and IPv6).
+- Redirects are followed manually (max 5 hops); the same IP checks apply to every hop.
+- URLs with embedded credentials (`user:pass@`) or query secrets (`token`, `key`, `signature`, `password`) are rejected before any request.
+- Reports never overwrite existing files; a UTC timestamp suffix (`_YYYYMMDD_HHMMSS`) is added when a file exists, and the final path is printed.
+- Every string written to reports, logs, and exceptions is redacted: the configured `TINYFISH_API_KEY` value and patterns matching `sk-...` or `X-API-Key` header values are replaced with `[REDACTED_KEY]`.
+
 ## Batch mode (`--batch FILE`)
 
 FILE is a text or CSV file with one `url[,query]` per line. Lines starting with `#` are comments; blank lines are ignored. If the query is omitted, it is derived from the page.

@@ -598,13 +598,13 @@ class Units(unittest.TestCase):
             mock_audit.assert_called_once()
             self.assertEqual(mock_audit.call_args[0][1], "interactive query")
 
-        # 3. Invalid URL exits with code 2
+        # 3. Invalid URL exits with code 1
         with mock.patch("sys.argv", ["ai_seo_auditor.py", "invalid_host"]), \
              mock.patch.dict(os.environ, {"TINYFISH_API_KEY": "test_key"}), \
              mock.patch("sys.stderr.write"):
             with self.assertRaises(SystemExit) as cm:
                 A.main()
-            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(cm.exception.code, 1)
 
 
     def test_finding_dataclass_fields_and_dict(self):
