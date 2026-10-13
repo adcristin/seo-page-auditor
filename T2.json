@@ -1,0 +1,35 @@
+{
+  "status": "not_found",
+  "url": "https://docs.python.org/3/library/requests.html",
+  "url_note": null,
+  "checked_at": "2026-10-13T07:43:37+00:00",
+  "scores": {
+    "ai_readability": null,
+    "search_visibility": null
+  },
+  "findings": [
+    {
+      "area": "access",
+      "sev": "high",
+      "title": "This URL does not exist (404)",
+      "evidence": "TinyFish Fetch: page_not_found (HTTP 404).",
+      "fix": "Check the URL for typos. If the page moved or was deleted, add a 301 redirect to its replacement. Closest pages the search index knows on docs.python.org: https://docs.python.org/3/library/urllib.request.html, https://docs.python.org/3/library/index.html, https://docs.python.org/3/library/http.client.html.",
+      "affects": "both",
+      "ties": "No content is available at this URL (404 observed by TinyFish Fetch). It cannot be quoted by AI fetchers until it responds with content; links to it have no target to cite.",
+      "confidence": "likely",
+      "verify": "curl -sI \"https://docs.python.org/3/library/requests.html\"",
+      "snippet": "",
+      "agent_prompt": ""
+    }
+  ],
+  "calls": [
+    [
+      "fetch",
+      "markdown https://docs.python.org/3/library/requests.html"
+    ],
+    [
+      "search",
+      "site:docs.python.org 3 library requests html (page 0)"
+    ]
+  ]
+}

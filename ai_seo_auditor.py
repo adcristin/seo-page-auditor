@@ -20,6 +20,7 @@ import os
 import random
 import re
 import sys
+import html
 import time
 import ipaddress
 from dataclasses import dataclass, asdict
@@ -47,6 +48,10 @@ BOTS = {
 }
 STOP = set("a an and are as at be by for from how in is it of on or that the to what when where which who why with your you".split())
 PEN = {"high": 15, "med": 7, "low": 3, "info": 0}
+
+def e(text) -> str:
+    """Escape untrusted text for HTML interpolation. Every page value goes through this."""
+    return html.escape(str(text))
 
 # --------------------------------------------------------------------------- redaction
 API_KEY_VALUE = os.environ.get("TINYFISH_API_KEY", "")
@@ -151,6 +156,8 @@ class Finding:
     ties: str = ""  # how this readability issue turns into a visibility issue
     confidence: str = ""  # verified | likely | unverified
     verify: str = ""      # one-line command or step to check it
+    snippet: str = ""     # ready-to-paste fix built only from page facts
+    agent_prompt: str = ""  # short coding-assistant instruction
 
 
 def norm(u: str) -> str:
@@ -275,6 +282,157 @@ def tokens(s: str) -> list[str]:
     return re.findall(r"\w+", (s or "").casefold(), re.UNICODE)
 
 
+def best_passage(md: str, terms: list[str]):
+    """Split markdown into passages and return the best for query terms."""
+    # Exclude boilerplate/hatnotes first
+    BOILERPLATE_PHRASES = {"redirects here", "for other uses", "from wikipedia", "this article", "jump to", "cookie", "consent", "navigation", "table of contents"}
+    cleaned = re.sub(r"```.*?```", "", md, flags=re.DOTALL)
+    cleaned = re.sub(r"`[^`]*`", "", cleaned)
+    lines = []
+    for l in cleaned.splitlines():
+        s = l.strip()
+        if not s:
+            continue
+        if re.match(r"^\s*[-*]\s*\[.*?\]\(.*?\)\s*$", s):
+            continue
+        if re.match(r"^\s*(Table of Contents|TOC|Navigation|Menu)\s*$", s, re.I):
+            continue
+        lines.append(s)
+    # Build passages without crossing heading boundaries
+    passages = []
+    current_words = []
+    def flush():
+        nonlocal current_words
+        text = " ".join(current_words).strip()
+        if text:
+            passages.append(text)
+        current_words = []
+    for l in lines:
+        # Heading boundary: flush current and start new if heading line
+        if re.match(r"^#{1,6}\s+", l):
+            flush()
+            # Skip the heading line itself from passage (don't include heading text as passage start)
+            continue
+        current_words.append(l)
+        wcount = len(re.findall(r"\w+", " ".join(current_words)))
+        if wcount >= 25:
+            if wcount > 120:
+                all_words = " ".join(current_words).split()
+                chunk_words = all_words[:120]
+                passages.append(" ".join(chunk_words))
+                rest = all_words[120:]
+                current_words = [" ".join(rest)]
+            else:
+                flush()
+    if current_words:
+        text = " ".join(current_words).strip()
+        if text:
+            passages.append(text)
+    # Filter passages: exclude boilerplate/hatnote lines
+    filtered = []
+    for p in passages:
+        lower_p = p.lower()
+        # Skip short nav-like lines
+        if len(p.split()) < 6:
+            continue
+        # Skip passages containing boilerplate phrases
+        has_boilerplate = any(bp in lower_p for bp in BOILERPLATE_PHRASES)
+        if has_boilerplate:
+            continue
+        filtered.append(p)
+    # Prefer 25-120 word sentence-like passages (contain period or question mark)
+    result = []
+    for p in filtered:
+        pw = len(re.findall(r"\w+", p))
+        if 25 <= pw <= 120:
+            if ("." in p or "?" in p):
+                result.append(p)
+    # If no sentence-like passages found, fall back to any 25-120 word passage
+    if not result:
+        for p in filtered:
+            pw = len(re.findall(r"\w+", p))
+            if 25 <= pw <= 120:
+                result.append(p)
+    if not terms or not result:
+        return None
+    best = None
+    best_score = -1
+    best_words = None
+    best_offset = None
+    for idx, p in enumerate(result):
+        text_lower = p.lower()
+        hits = 0
+        for t in terms:
+            # Token match with acronym
+            t_lower = t.lower()
+            matched = False
+            if t_lower in text_lower.split():
+                # Actually need token-level check; use tokens
+                pass
+            # Use token-based matching
+            p_tokens = set(tokens(p.lower()))
+            x_lower = t_lower
+            if x_lower in p_tokens:
+                matched = True
+            else:
+                plural_x = x_lower + "s"
+                possessive_x = x_lower + "'s"
+                for tok in p_tokens:
+                    if tok == plural_x or tok == possessive_x:
+                        matched = True
+                        break
+            if matched:
+                hits += 1
+            else:
+                initials = "".join(w[0] for w in re.findall(r"\w+", p) if len(w) > 1)
+                if x_lower in initials.lower():
+                    hits += 1
+        sentence_bonus = 0.05 if ("." in p or "?" in p) else 0
+        coverage = (hits / len(terms)) + sentence_bonus if terms else 0
+        # Cap coverage at 100%
+        coverage = min(coverage, 1.0)
+        if coverage > best_score:
+            best_score = coverage
+            best = p
+            best_words = len(re.findall(r"\w+", p))
+            best_offset = len(re.findall(r"\w+", " ".join(result[:idx])))
+    return {
+        "passage": best,
+        "coverage": round(best_score, 2),
+        "offset_words": best_offset,
+        "length_words": best_words,
+    }
+
+def normalize_text_for_parity(text: str) -> str:
+    """Strip artifacts that don't exist in raw HTML text: list numbers/bullets, footnote markers, pipes, emphasis, backticks, code fences."""
+    text = text or ""
+    lines = text.splitlines()
+    result_lines = []
+    skip_sections = False
+    skip_headers = {"references", "notes", "citations", "external links", "see also", "further reading"}
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower in skip_headers or lower.startswith(tuple(skip_headers)):
+            skip_sections = True
+            continue
+        if skip_sections and re.match(r"^#{1,6}\s+", line):
+            skip_sections = False
+        if skip_sections:
+            if re.match(r"^#{1,6}\s+", line):
+                skip_sections = False
+            else:
+                continue
+        line = re.sub(r"^\s*(?:\d+[.)]\s+|[-*+]\s+)", "", line)
+        line = re.sub(r"\[\d+\]", "", line)
+        line = re.sub(r"\|", " ", line)
+        line = re.sub(r"[*_`]+", "", line)
+        line = re.sub(r"```.*?```", " ", line, flags=re.DOTALL)
+        line = re.sub(r"`[^`]*`", " ", line)
+        result_lines.append(line)
+    return " ".join(result_lines)
+
+
 def clean(s) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ").replace("\u00b6", "")).strip()
 
@@ -357,24 +515,39 @@ def get_terms(s: str, use_bigrams: bool = False) -> set[str]:
     return {text[i:i+2] for i in range(len(text) - 1)}
 
 def term_hits(terms: list[str], text: str):
-    """Share of query terms present in text. 'seo' also matches 'Search Engine Optimization'."""
+    """Share of query terms present in text. 'seo' also matches 'Search Engine Optimization'. Uses token matching (not substring) with simple plural/possessive 's' allowed."""
     if not terms:
         return None
     t = clean(text).lower()
-    # Use bigrams for both if the text is CJK
     cjk = is_cjk(t)
     search_text = t if not cjk else t.casefold()
-
-    # For CJK, we check if the term (which might be a bigram) is in the text
-    # For English, we keep the acronym logic.
     hits = 0
+    text_tokens = set(tokens(search_text))
     for x in terms:
-        if x in search_text:
+        x_lower = x.lower()
+        if cjk:
+            # For CJK, keep substring fallback but only for bigram terms
+            if x_lower in search_text:
+                hits += 1
+            continue
+        # Token matching with simple plural/possessive "s"
+        matched = False
+        if x_lower in text_tokens:
+            matched = True
+        else:
+            # Allow plural/possessive "s"
+            plural_x = x_lower + "s"
+            possessive_x = x_lower + "'s"
+            for tok in text_tokens:
+                if tok == plural_x or tok == possessive_x:
+                    matched = True
+                    break
+        if matched:
             hits += 1
-        elif not cjk and (3 <= len(x) <= 6):
+        elif 3 <= len(x_lower) <= 6:
             # Acronym logic: 'seo' matches 'S... E... O...'
-            initials = "".join(w[0] for w in tokens(t))
-            if x in initials:
+            initials = "".join(w[0] for w in tokens(t) if len(w) > 1)
+            if x_lower in initials.lower():
                 hits += 1
     return hits / len(terms)
 
@@ -389,21 +562,53 @@ def key_terms(q: str) -> list[str]:
 
 def extract_topic_gaps(audited_page, comps_data, query_terms):
     """Find topics present in competitors but missing from the audited page."""
-    BOILERPLATE = {"navigation", "table of contents", "related", "comments", "share", "menu", "search", "footer"}
-
-    # Detect CJK for the whole analysis
+    BOILERPLATE = {"navigation", "table of contents", "related", "comments", "share", "menu", "search", "footer", "view post in", "top posts", "subscribe", "frequently asked questions", "introduction", "customer testimonials", "integrations"}
+    IMPERATIVE_CTA_STARTS = {"get", "try", "book", "start", "sign up", "generate", "request", "download", "contact", "revolutionize", "join", "subscribe", "learn more"}
+    # Brand token for competitor filtering
     audit_md = audited_page.get("text") or ""
     cjk = is_cjk(audit_md)
+    # Get competitor brand tokens from URLs
+    comp_brand_tokens = set()
+    for c in comps_data:
+        url = c.get("url", "")
+        host = urlparse(url).netloc.lower() if url else ""
+        token = host.split(".")[0] if host else ""
+        if token and len(token) >= 4:
+            comp_brand_tokens.add(token)
 
     # 1. Extract and normalize competitor H2s
-    comp_topics = [] # list of (original_text, token_set, comp_idx)
+    comp_topics = []
     for idx, c in enumerate(comps_data):
         h2s = c.get("h2_texts", [])
         for h in h2s:
             h_clean = clean(h)
-            if any(b in h_clean.lower() for b in BOILERPLATE):
+            # Strip numbering prefixes
+            h_clean = re.sub(r"^\s*\d+[.)]\s*", "", h_clean)
+            h_clean = re.sub(r"^\s*\d+\)\s*", "", h_clean)
+            # Drop boilerplate headings
+            lower_h = h_clean.lower()
+            if any(b in lower_h for b in BOILERPLATE):
                 continue
-            # Use bigrams for CJK
+            # Drop imperative CTAs
+            first_word = lower_h.split()[0] if lower_h.split() else ""
+            if first_word in IMPERATIVE_CTA_STARTS:
+                continue
+            # Drop headings that contain a competitor's own brand token (only whole-word match for token >=4)
+            has_comp_brand = False
+            for bt in comp_brand_tokens:
+                words = set(tokens(h_clean.lower()))
+                if bt.lower() in words:
+                    has_comp_brand = True
+                    break
+            if has_comp_brand:
+                continue
+            # Drop headings that are only a product/vendor name (single token and matches brand token)
+            h_words = tokens(h_clean)
+            if len(h_words) <= 2 and any(w.lower() in comp_brand_tokens for w in h_words):
+                # This is a competitor name heading; skip unless it also covers general topic
+                # Keep if it has 3+ words (more descriptive)
+                if len(h_words) < 3:
+                    continue
             t_set = get_terms(h_clean, use_bigrams=cjk) - (set(STOP) if not cjk else set())
             if t_set:
                 comp_topics.append((h_clean, t_set, idx))
@@ -412,7 +617,7 @@ def extract_topic_gaps(audited_page, comps_data, query_terms):
         return []
 
     # 2. Merge near-duplicates and identify candidate topics
-    topics = [] # list of { "representative": str, "tokens": set, "comps": set() }
+    topics = []
     for text, t_set, idx in comp_topics:
         merged = False
         for topic in topics:
@@ -424,13 +629,18 @@ def extract_topic_gaps(audited_page, comps_data, query_terms):
         if not merged:
             topics.append({"representative": text, "tokens": t_set, "comps": {idx}})
 
-    # 3. Filter by frequency or query terms
+    # 3. Filter by frequency (at least 2 competitors) — removed "contains query term" shortcut
     qualified = []
     for t in topics:
         is_common = len(t["comps"]) >= 2
-        has_query = any(q in t["tokens"] for q in query_terms)
-        if is_common or has_query:
+        if is_common:
             qualified.append(t)
+
+    # If fewer than 2 competitors have headings, or no topic survives, emit no finding
+    if len(comps_data) < 2:
+        return []
+    if not qualified:
+        return []
 
     # 4. Remove topics covered by audited page
     audit_excerpt = " ".join(tokens(audit_md[:2000]))
@@ -750,14 +960,32 @@ def ld_summary(blocks: list[str]):
 def coverage(rendered_md: str, raw_text: str, n=12, w=8):
     """Sample n windows of w words from the rendered page; how many exist in the raw HTML text?
     Returns (share present, readable passages that are missing)."""
-    toks = tokens(re.sub(r"\]\([^)]*\)", " ", rendered_md))
+    norm_md = normalize_text_for_parity(rendered_md)
+    norm_raw = normalize_text_for_parity(raw_text)
+    toks = tokens(norm_md)
     if len(toks) < w * 3:
         return None, []
+    # Filter windows: must have at least 6 plain words, no digits? The instruction says windows of 6+ plain words without digits.
+    # We'll select windows of w words that contain at least 6 words and no digits.
     step = max(1, (len(toks) - w) // n)
-    wins = [toks[i:i + w] for i in range(0, len(toks) - w, step)][:n]
-    hay = "".join(tokens(raw_text))  # spacing-insensitive on both sides
+    raw_wins = [toks[i:i + w] for i in range(0, len(toks) - w, step)][:n]
+    # Filter windows to those with at least 6 words and no digits
+    filtered_wins = []
+    for win in raw_wins:
+        joined = " ".join(win)
+        words_only = re.findall(r"[a-zA-Z]+", joined)
+        if len(words_only) >= 6 and not re.search(r"\d", joined):
+            filtered_wins.append(win)
+    if not filtered_wins:
+        # If no windows meet criteria, fall back to first windows but with lower quality
+        filtered_wins = raw_wins[:n]
+    wins = filtered_wins[:n]
+    hay = "".join(tokens(norm_raw))  # spacing-insensitive on both sides
     missing = [" ".join(x) for x in wins if "".join(x) not in hay]
-    return 1 - len(missing) / len(wins), missing
+    if not wins:
+        return None, []
+    cov = 1 - len(missing) / len(wins)
+    return cov, missing
 
 
 def shingle_words(text: str, n=5) -> set[str]:
@@ -776,13 +1004,19 @@ def extraction_retention(raw_text: str, md_text: str) -> float | None:
     return len(common) / len(raw_shingles)
 
 
+BOILERPLATE_HEADINGS = {"contents", "navigation menu", "menu", "table of contents", "personal tools", "namespaces", "views", "tools", "search", "footer"}
+
 def headings_lost(dom_heads: list[tuple[int, str]], md_text: str) -> list[str]:
     md_heads = [t for l, t in md_stats(md_text)[0] if l in (1, 2, 3)]
     md_set = {clean(h) for h in md_heads}
     lost = []
     for lvl, t in dom_heads:
-        if lvl in (1, 2, 3) and clean(t) not in md_set:
-            lost.append(clean(t))
+        clean_t = clean(t)
+        lower_t = clean_t.lower()
+        if lower_t in BOILERPLATE_HEADINGS or lower_t.startswith(tuple(BOILERPLATE_HEADINGS)):
+            continue
+        if lvl in (1, 2, 3) and clean_t not in md_set:
+            lost.append(clean_t)
     # dedupe preserving order
     seen = set()
     unique_lost = []
@@ -827,6 +1061,213 @@ def suggest_title(h1: str, title: str, site: str) -> str:
         core = core[:room].rsplit(" ", 1)[0]
     return f"{core} | {site}" if site else core
 
+
+def _max_backtick_run(s: str) -> int:
+    max_run = 0
+    curr = 0
+    for ch in s:
+        if ch == '`':
+            curr += 1
+            max_run = max(max_run, curr)
+        else:
+            curr = 0
+    return max_run
+
+def _fence(s: str) -> str:
+    ticks = '`' * (_max_backtick_run(s) + 1)
+    if len(ticks) < 3:
+        ticks = '```'
+    return ticks
+
+def build_snippet_title_meta(h1: str, title: str, query: str, terms: list[str], desc: str, final_url: str, meta: dict, md_text: str) -> str:
+    core_title = (h1 or title or "").strip()
+    proposal_title = core_title[:55].rsplit(" ", 1)[0] if len(core_title) > 60 else core_title
+    if not proposal_title:
+        proposal_title = "Page topic"
+    proposal_title = proposal_title[:60]
+    sentences = re.split(r"(?<=[.!?])\s+", (md_text or "").replace("\n", " ").strip())
+    first_sentences = []
+    length = 0
+    for s in sentences:
+        clean_s = clean(s)
+        if clean_s and len(clean_s.split()) >= 3:
+            first_sentences.append(clean_s)
+            length += len(clean_s)
+            if length >= 140:
+                break
+    desc_text = " ".join(first_sentences)[:160]
+    page_text = (h1 or "") + " " + (md_text or "") + " " + desc_text
+    has_terms = True
+    if terms:
+        hits = sum(1 for t in terms if t in page_text.lower())
+        has_terms = hits > 0
+    snippet = f"Proposed title ({len(proposal_title)} chars): {proposal_title}\n"
+    snippet += f"Proposed meta description ({len(desc_text)} chars): {desc_text}\n"
+    snippet += f"Target URL: {final_url}\n"
+    snippet += "Assembled from page H1 and opening sentences only."
+    return snippet
+
+def build_snippet_canonical(final_url: str, meta: dict) -> str:
+    can = meta.get("canonical", "")
+    if can:
+        return f'<link rel="canonical" href="{can}">'
+    return f'<link rel="canonical" href="{final_url}">'
+
+def build_snippet_og_twitter(title: str, desc: str, meta: dict, final_url: str, first_image_url: str) -> str:
+    og = meta.get("og") or {}
+    parts = []
+    if title:
+        parts.append(f'<meta property="og:title" content="{title}" />')
+    if desc:
+        parts.append(f'<meta property="og:description" content="{desc}" />')
+    if first_image_url:
+        parts.append(f'<meta property="og:image" content="{first_image_url}" />')
+        parts.append(f'<meta property="og:url" content="{final_url}" />')
+    twitter = meta.get("twitter") or {}
+    if twitter.get("card"):
+        card = twitter.get("card", "")
+        parts.append(f'<meta name="twitter:card" content="{card}" />')
+    if title:
+        parts.append(f'<meta name="twitter:title" content="{title}" />')
+    if desc:
+        parts.append(f'<meta name="twitter:description" content="{desc}" />')
+    if first_image_url:
+        parts.append(f'<meta name="twitter:image" content="{first_image_url}" />')
+    if not parts:
+        return "# No real OG/Twitter values found on the page; omit tags with no value."
+    return "\n".join(parts)
+
+def build_snippet_jsonld(p: dict, desc: str, meta: dict, final_url: str, is_article: bool, raw_jsonld_blocks: list, path: str) -> str:
+    types_found = []
+    for b in raw_jsonld_blocks:
+        try:
+            data = json.loads(b)
+            def walk(o):
+                if isinstance(o, dict):
+                    t = o.get("@type")
+                    if t:
+                        types_found.append(t)
+                    for v in o.values():
+                        if isinstance(v, (dict, list)):
+                            walk(v)
+                elif isinstance(o, list):
+                    for item in o:
+                        walk(item)
+            walk(data)
+        except Exception:
+            pass
+    block_text = " ".join(str(x) for x in (raw_jsonld_blocks or [])).lower()
+    has_date_author = bool(p.get("published") or p.get("author"))
+    faq_evidence = False
+    if raw_jsonld_blocks:
+        for b in raw_jsonld_blocks:
+            try:
+                data = json.loads(b)
+                def has_faq(o):
+                    if isinstance(o, dict):
+                        if o.get("@type") == "FAQPage" or "mainEntity" in o:
+                            return True
+                        for k, v in o.items():
+                            if isinstance(v, (dict, list)):
+                                return has_faq(v)
+                    elif isinstance(o, list):
+                        for item in o:
+                            if has_faq(item):
+                                return True
+                    return False
+                if has_faq(data):
+                    faq_evidence = True
+            except Exception:
+                pass
+    software_evidence = bool(re.search(r"\b(software|application|app)\b", (p.get("text", "") or "").lower()) and bool(p.get("author")))
+    if has_date_author and (is_article or bool(re.search(r"datepublished|author", block_text))):
+        chosen_type = "Article"
+        evidence_str = "Article: date/author found in page or JSON-LD; path or meta suggests article."
+    elif faq_evidence:
+        chosen_type = "FAQPage"
+        evidence_str = "FAQPage: JSON-LD contains FAQPage/mainEntity; real Q&A structure detected."
+    elif software_evidence:
+        chosen_type = "SoftwareApplication"
+        evidence_str = "SoftwareApplication: page text mentions software/application and has author/detail evidence."
+    elif is_article:
+        chosen_type = "WebPage"
+        evidence_str = "WebPage: path suggests article but no date/author evidence found; using WebPage."
+    elif p.get("h1") and p.get("title"):
+        chosen_type = "WebSite"
+        evidence_str = "WebSite: homepage-like content (no specific article/software/FAQ evidence)."
+    else:
+        chosen_type = "WebPage"
+        evidence_str = "WebPage: default for general page with no stronger type evidence."
+    d = {"@context": "https://schema.org", "@type": chosen_type}
+    if chosen_type == "Article":
+        d["headline"] = p.get("h1") or p.get("title") or ""
+        d["description"] = desc or (p.get("excerpt", "") or "")
+        d["url"] = final_url
+        if p.get("published"):
+            d["datePublished"] = p.get("published")
+        if p.get("author"):
+            d["author"] = {"@type": "Person", "name": p.get("author")}
+        img = meta.get("og", {}).get("image")
+        if img:
+            d["image"] = img[0] if isinstance(img, list) else img
+    elif chosen_type == "FAQPage":
+        d["name"] = p.get("h1") or p.get("title") or ""
+        d["url"] = final_url
+        d["mainEntity"] = []
+        evidence_str += " (mainEntity is empty skeleton until real Q&A pairs are added)"
+    elif chosen_type == "Organization" or chosen_type == "WebSite":
+        d["name"] = p.get("title") or p.get("h1") or ""
+        d["url"] = final_url
+        d["description"] = desc or ""
+        img = meta.get("og", {}).get("image")
+        if img:
+            d["image"] = img[0] if isinstance(img, list) else img
+    else:
+        if chosen_type == "SoftwareApplication":
+            d["name"] = p.get("title") or p.get("h1") or ""
+            d["description"] = desc or ""
+            d["url"] = final_url
+        else:
+            d["name"] = p.get("h1") or p.get("title") or ""
+            d["description"] = desc or ""
+            d["url"] = final_url
+    skeleton_text = json.dumps(d, indent=2)
+    snippet = f"# JSON-LD type selected: {chosen_type}\nEvidence: {evidence_str}\nOnly fields with real values included; no placeholders like 'WRITE A SUMMARY'.\n\n```json\n{skeleton_text}\n```"
+    return snippet
+
+def build_snippet_robots(origin: str, robots_text: str, include_sitemap=True, include_bot_allow=False) -> str:
+    snippet = ""
+    if include_sitemap:
+        snippet += f"Sitemap: {origin}/sitemap.xml\n"
+    if include_bot_allow:
+        snippet += "# Optional AI-bot Allow stanza (labelled optional):\n"
+        snippet += "# User-agent: OAI-SearchBot\n# User-agent: PerplexityBot\n# Allow: /\n"
+        snippet += "# Note: optional; only include if you want to allow these bots.\n"
+    return snippet
+
+def build_snippet_llms(origin: str, links: list) -> str:
+    top10 = links[:10] if links else []
+    snippet = "# llms.txt skeleton (optional)\n"
+    snippet += f"# Source: {origin}\n"
+    snippet += "# Descriptions derived from internal links (link text approximated from URL path)\n"
+    for idx, link in enumerate(top10, 1):
+        text = link.get("text", "") if isinstance(link, dict) else ""
+        url = link.get("url", link) if isinstance(link, dict) else link
+        desc = text if text else url.replace(origin, "").lstrip("/") or "Homepage"
+        snippet += f"- [{desc}]({url})\n"
+    snippet += "# Note: optional; label clearly. Include only top 10 by position."
+    return snippet
+
+def build_agent_prompt(url: str, finding: dict, snippet_text: str) -> str:
+    prompt = (
+        f"Page URL: {url}\n"
+        f"Evidence: {finding.get('evidence', '')}\n"
+        f"Desired fix: {finding.get('fix', '')}\n"
+        f"Snippet (ready-to-paste):\n{snippet_text}\n"
+        f"How to verify: {finding.get('verify', '')}\n"
+        "Apply the snippet from evidence above. Ensure any backticks are kept intact when pasting."
+    )
+    return prompt
 
 def jsonld_skeleton(p: dict, desc: str, meta: dict, final_url: str, article: bool) -> str:
     og = meta.get("og") or {}
@@ -886,7 +1327,29 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
 
     p = urlparse(url)
     host, origin = p.netloc.lower(), f"{p.scheme}://{p.netloc}"
-    brand_token = host.split(".")[0]
+    PUBLIC_SUFFIXES = {"co.uk", "com.au", "co.in", "vercel.app", "netlify.app", "github.io", "pages.dev", "onrender.com", "herokuapp.com"}
+    def get_brand_token(hostname: str) -> str:
+        parts = hostname.split(".")
+        # Find registrable domain label
+        # Try removing suffixes from end
+        if len(parts) >= 3:
+            # Check two-part suffixes
+            suffix2 = ".".join(parts[-2:])
+            if suffix2 in PUBLIC_SUFFIXES:
+                return parts[-3]
+            # Check one-part suffixes that are hosting platforms
+            suffix1 = parts[-1]
+            if suffix1 in PUBLIC_SUFFIXES:
+                return parts[-2]
+        # For normal domains: label before TLD (e.g., wikipedia.org -> wikipedia, python.org -> python)
+        # Skip language subdomains (en, de) if they are first part and domain has 3+ parts
+        if len(parts) >= 3:
+            # If first part is a language code (2 chars), skip it
+            first = parts[0]
+            if len(first) == 2 and first.isalpha():
+                return parts[-2] if len(parts) >= 3 else parts[-2]
+        return parts[-2] if len(parts) >= 2 else parts[-1]
+    brand_token = get_brand_token(host)
 
     # ---- FETCH 1: the page as an AI tool extracts it (rendered, live)
     http_fallback_used = False
@@ -1024,6 +1487,19 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     if not query:
         query, query_src = derive_query(title, h1), "derived from the page's own H1/title (tests findability by name only; pass -q for a real keyword test)"
     terms = key_terms(query)
+    best_passage_result = best_passage(md, terms) if terms else None
+    if best_passage_result:
+        bp = best_passage_result
+        if bp["coverage"] < 0.5:
+            add("content", "med", "No passage answers the query directly",
+                f"Best passage covers only {int(bp['coverage']*100)}% of query terms (at word {bp['offset_words']}). Suggest adding a direct 40-60 word answer under the H1.",
+                "Write a concise 40-60 word answer that uses the query terms directly under the H1.", "search",
+                confidence="likely", verify=f"Read first 600 words of {final_url}")
+        if bp["offset_words"] > 600:
+            add("content", "low", "The best answer sits deep in the page",
+                f"Best passage starts at word {bp['offset_words']} (length {bp['length_words']} words).",
+                "Move the core answer closer to the top, ideally within the first 600 words.", "ai",
+                confidence="likely", verify=f"Read first 600 words of {final_url}")
     if not terms:
         add("content", "low", "Query terms could not be analysed",
             "The provided query contains no recognisable words (e.g. it is composed only of symbols or emojis).",
@@ -1091,6 +1567,12 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     # Skip rules
     skip_topic = norm_query(topic_query) == norm_query(target_query)
     skip_brand = norm_query(brand_query) == norm_query(target_query)
+    # Skip brand query if token too short (<4 chars) or is a stopword/language code
+    brand_token_short_or_stop = len(brand_token) < 4 or brand_token in STOP or (len(brand_token) == 2 and brand_token.isalpha())
+    if brand_token_short_or_stop:
+        # Log skip in call log
+        tf.calls.append(("search", f"brand query skipped: token too short or language code ({brand_token})"))
+        skip_brand = True
 
     visibility = {}
     # (a) target query
@@ -1323,11 +1805,22 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                         confidence="likely", verify=f'curl -sL "{final_url}" | wc -w')
                 # Headings lost
                 lost_heads = headings_lost(dom_heads, md)
+                h1_only_missing = False
                 if lost_heads:
-                    add("content", "low", "Headings lost in AI extraction", f"H1-H3 headings present in the raw HTML but missing from the Fetch markdown: {', '.join(lost_heads[:5])}.",
-                        "Keep headings in plain HTML so extractors see them.", "ai",
-                        "Headings guide extractors; lost headings mean topic structure is invisible.",
-                        confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "<h[1-3]"')
+                    # Check if only H1 is missing (other headings present in md?)
+                    md_heads = [t for l, t in md_stats(md)[0] if l in (1, 2, 3)]
+                    if len(lost_heads) == 1 and clean(lost_heads[0]).lower() == clean(next((t for lvl, t in dom_heads if lvl == 1), "")).lower():
+                        h1_only_missing = True
+                    if h1_only_missing:
+                        add("content", "info", "The extractor's markdown omitted the H1 although it is in the HTML",
+                            "The extractor's markdown omitted the H1 although it is in the HTML. This may be an extraction quirk, not a page problem.",
+                            "No fix needed for the page; this is an extraction quirk.", "ai",
+                            confidence="likely", verify=f'curl -sL "{final_url}" | grep -i "<h1"')
+                    else:
+                        add("content", "low", "Headings lost in AI extraction", f"H1-H3 headings present in the raw HTML but missing from the Fetch markdown: {', '.join(lost_heads[:5])}.",
+                            "Keep headings in plain HTML so extractors see them.", "ai",
+                            "Headings guide extractors; missing headings reduce observed topic structure.",
+                            confidence="likely", verify=f'curl -sL "{final_url}" | grep -iE "<h[1-3]"')
             # Compute parity regardless of skip for JSON/table
             raw_words = len(re.findall(r"\w+", raw["text"] or ""))
             ret_val = extraction_retention(raw["text"], md) if (raw_words >= 100 and not is_challenge) else None
@@ -1352,13 +1845,53 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 parity = {"js_only_pct": None, "extraction_retention_pct": None, "headings_lost": []}
             js_only = round((1 - cov) * 100) if cov is not None else None
             # Original JS-dependence finding (only once)
-            if cov is not None and cov < 0.85:
-                sev = "high" if cov < 0.5 else "med"
-                add("content", sev, "Much of the text only exists after JavaScript runs",
-                    f"{round((1 - cov) * 100)}% of sampled passages from the rendered page are absent from the raw HTML. Example passage missing from raw HTML: \"{miss[0]}...\"",
-                    "Server-side render or statically generate the main content (SSR/SSG). Verify with `curl -s URL | grep -i 'a phrase from the page'`.", "both",
-                    "Typical effect: some crawlers read only raw HTML, so text that requires JavaScript may not be observed by them. This is not proof that the page is excluded from any index.",
-                    confidence="verified", verify=f'curl -sL "{final_url}" | grep -i "{miss[0][:30]}"')
+            absent_pct = round((1 - cov) * 100) if cov is not None else None
+            if cov is not None:
+                # Between 15% and 30%: only parity table line, no finding
+                if absent_pct > 60:
+                    sev = "high"
+                elif absent_pct >= 30:
+                    sev = "med"
+                elif absent_pct >= 15:
+                    sev = None  # only parity line
+                else:
+                    sev = None  # no finding below 30%
+                # Build original-text passage example (not normalized) for display and verify
+                # Use a window from the original rendered md that is missing from raw HTML
+                original_passage_example = ""
+                if miss:
+                    # Pick the shortest missing passage that has 6+ words and no digits for verify fragment
+                    candidates = []
+                    for m in miss:
+                        words = re.findall(r"[a-zA-Z]+", m)
+                        if len(words) >= 6 and not re.search(r"\d", m):
+                            candidates.append(m)
+                    if candidates:
+                        original_passage_example = candidates[0]
+                    else:
+                        original_passage_example = miss[0] if miss else ""
+                # Verify command uses original fragment (4-5 words) with grep -i -F
+                verify_fragment = ""
+                if original_passage_example:
+                    words = original_passage_example.split()
+                    # Pick 4-5 word fragment from original text (not normalized)
+                    if len(words) >= 4:
+                        verify_fragment = " ".join(words[:5])
+                    else:
+                        verify_fragment = original_passage_example
+                # Confidence: verified only if raw GET text confirmed absence of exact fragment
+                # Since coverage already compares against raw_text (normalized), we treat it as verified when raw exists and is not a challenge/non-html.
+                confidence = "verified" if (raw and not raw.get("non_html") and not is_challenge and raw_words >= 100) else "likely"
+                if sev:
+                    # Show example passage in original text (casing and punctuation kept)
+                    display_example = original_passage_example[:200] if original_passage_example else (miss[0][:200] if miss else "")
+                    evidence_str = (f"{absent_pct}% of sampled passages from the rendered page are absent from the raw HTML. "
+                                     f"Example passage missing from raw HTML: \"{display_example}\"" if display_example else f"{absent_pct}% of sampled passages absent.")
+                    add("content", sev, "Much of the text only exists after JavaScript runs",
+                        evidence_str,
+                        "Server-side render or statically generate the main content (SSR/SSG). Verify with `grep -i -F`.", "both",
+                        "Typical effect: some crawlers read only raw HTML, so text that requires JavaScript may not be observed by them. This is not proof that the page is excluded from any index.",
+                        confidence=confidence, verify=f'grep -i -F "{verify_fragment}" <(curl -sL "{final_url}")' if verify_fragment else f'curl -sL "{final_url}" | head -n 30')
             # Skip rules for retention/headings
             raw_words = len(re.findall(r"\w+", raw["text"] or ""))
             is_challenge = looks_like_challenge(title, md, count_words(md))
@@ -1541,12 +2074,15 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
                 f"Returned instead: {urls_named}.",
                 "Check internal links and canonical settings so the intended page is preferred for this query.", "search",
                 confidence="likely", verify=f'Search "{target_query}"')
-        # Possible name overlap on other domains (title contains brand token)
+        # Possible name overlap on other domains (title contains brand token as whole word)
         overlap = []
-        for r in target_serp:
-            url_host = urlparse(r.get("url", "")).netloc.lower()
-            if url_host and url_host != host and brand_token in (r.get("title", "") or "").lower():
-                overlap.append(r.get("url", ""))
+        if len(brand_token) >= 4:
+            for r in target_serp:
+                url_host = urlparse(r.get("url", "")).netloc.lower()
+                if url_host and url_host != host:
+                    title_words = set(tokens((r.get("title", "") or "").lower()))
+                    if brand_token.lower() in title_words:
+                        overlap.append(r.get("url", ""))
         if overlap:
             overlap_list = ", ".join(overlap[:3])
             add("visibility", "info", "Possible name overlap",
@@ -1570,6 +2106,51 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
     order = {"high": 0, "med": 1, "low": 2, "info": 3}
     F.sort(key=lambda f: order[f.sev])
 
+    # ---- Populate snippet and agent_prompt for each finding
+    first_image_url = ""
+    real_images = [i for i in images if not i.get("decorative")]
+    if real_images:
+        first_img = real_images[0]
+        src = first_img.get("src", "")
+        if src and src.startswith("/"):
+            first_image_url = origin + src
+        elif src:
+            first_image_url = src
+    links_list = page.get("links") or []
+    for f in F:
+        snippet_text = ""
+        # Attach snippet only when it is the real fix for this finding
+        if f.title == "No canonical URL" or (f.area == "metadata" and "canonical" in f.title and "points" not in f.title):
+            snippet_text += build_snippet_canonical(final_url, meta) + "\n"
+        elif f.title == "Missing title tag" or (f.area == "metadata" and ("Title tag" in f.title or "description" in f.title.lower())):
+            snippet_text += build_snippet_title_meta(h1, title, query or "", terms, desc, final_url, meta, md) + "\n"
+        elif f.title == "Open Graph tags incomplete" or (f.area == "metadata" and "Open Graph" in f.title):
+            # Only missing tags, not full proposal
+            snippet_text += build_snippet_og_twitter(title, desc, meta, final_url, first_image_url) + "\n"
+        elif f.title == "No structured data (JSON-LD)" or f.title == "Invalid JSON-LD" or f.title.startswith("JSON-LD") or (f.area == "content" and "JSON-LD" in f.title):
+            snippet_text += build_snippet_jsonld(me, desc, meta, final_url, is_article, raw["jsonld"] if raw and not raw.get("non_html") else [], path) + "\n"
+        elif f.title == "No sitemap found" or f.title == "Page not found in sitemap":
+            snippet_text += build_snippet_robots(origin, robots_txt or "", include_sitemap=True, include_bot_allow=False) + "\n"
+        elif f.title == "No llms.txt":
+            snippet_text += build_snippet_llms(origin, links_list) + "\n"
+        elif f.title == "Declared sitemap could not be read":
+            # Never emit Sitemap line or AI-bot stanza for this finding
+            snippet_text = ""
+        else:
+            snippet_text = ""
+        # Agent prompt: only when snippet exists; otherwise short inspect/verify prompt
+        f.snippet = snippet_text
+        if snippet_text:
+            f.agent_prompt = build_agent_prompt(final_url, {
+                "evidence": f.evidence,
+                "fix": f.fix,
+                "verify": f.verify,
+            }, snippet_text)
+        else:
+            # Short inspect/verify prompt without "apply the snippet"
+            verify_cmd = f.verify or f"curl -sL \"{final_url}\" | head -n 30"
+            f.agent_prompt = f"Inspect the finding: {f.title}. Evidence: {f.evidence}. Verify with: {verify_cmd}"
+
     fix_first_titles = select_fix_first(F)
 
     return {
@@ -1585,6 +2166,8 @@ def audit(url: str, query: str | None, tf, do_raw=True, country: str | None = No
         "competitors": comps, "competitor_errors": comp_err, "findings": [asdict(f) for f in F], "fix_first": fix_first_titles, "calls": tf.calls,
         "category_scores": cat_scores, "topic_gaps": me.get("topic_gaps", []),
         "parity": parity,
+        "best_passage": best_passage_result,
+        "terms": terms,
     }
 
 
@@ -1638,7 +2221,22 @@ def to_markdown(r: dict) -> str:
          f"| robots.txt / llms.txt / in sitemap | {r['site']['robots_txt']} / {r['site']['llms_txt']} / {sm} |\n"
          f"| Bots blocked by robots.txt | {esc(', '.join(r['site']['blocked_bots']) or 'none')} |\n",
          "First 500 characters as extracted:\n\n```\n" + P["excerpt"] + "\n```\n",
-         "## How it shows up (TinyFish Search)\n"]
+         ]
+    bp = r.get("best_passage")
+    if bp and r.get("query"):
+        passage_text = (bp.get("passage") or "")[:400]
+        terms_for_highlight = [t for t in (r.get("terms") or []) if t and len(t) > 1]
+        highlighted = passage_text
+        for t in terms_for_highlight:
+            # Word-boundary highlight to avoid matching inside other words (e.g. "ai" in "mailbox")
+            pattern = r"(?<!\w)" + re.escape(t) + r"(?!\w)"
+            highlighted = re.sub(pattern, lambda m: f"**{m.group(0)}**", highlighted, flags=re.IGNORECASE)
+        o += [
+            "## Best passage for this query\n",
+            f"> {highlighted}\n",
+            f"- Coverage: **{int((bp.get('coverage', 0) or 0)*100)}%** | Word offset from top: **{bp.get('offset_words', 'n/a')}** | Length: **{bp.get('length_words', 'n/a')} words**\n",
+        ]
+    o += ["## How it shows up (TinyFish Search)\n"]
     e = r["serp_entry"]
     o.append(f"- Position for the query: **{rank}**")
     if e:
@@ -1678,7 +2276,25 @@ def to_markdown(r: dict) -> str:
             o.append(f"| JS-only % | {p.get('js_only_pct', 'n/a')}% |")
             o.append(f"| Extraction retention | {p.get('extraction_retention_pct', 'n/a')}% |")
             o.append(f"| Headings lost | {', '.join(p.get('headings_lost', [])) or 'none'} |")
+        # Snippet block (ready-to-paste fix) with fence length that exceeds any backtick run inside snippet
+        snippet_text = f.get("snippet", "")
+        if snippet_text:
+            fence_str = _fence(snippet_text)
+            o.append(f"\n**Snippet:**\n\n{fence_str}\n{snippet_text}\n{fence_str}\n")
+        agent_text = f.get("agent_prompt", "")
+        if agent_text:
+            fence_str2 = _fence(agent_text)
+            o.append(f"**Agent prompt:**\n\n{fence_str2}\n{agent_text}\n{fence_str2}\n")
         o.append("")
+    # Combined agent prompt (finding titles and fixes only, no repeated evidence or snippets)
+    combined_fix_lines = []
+    for f in r.get("findings", []):
+        fix_text = f.get("fix", "").splitlines()[0]
+        combined_fix_lines.append(f"- {f.get('title', '')} ({f.get('sev', '').upper()}): {fix_text}")
+    combined_prompt = "Inspect findings and apply fixes:\n" + "\n".join(combined_fix_lines) if combined_fix_lines else "No findings to fix."
+    # Keep combined prompt in JSON/HTML if needed; don't render as markdown block here (per-finding agent prompts remain in JSON)
+    # Insert as a short section instead of whole-plan snippets
+    o += ["## Combined agent prompt\n", f"{combined_prompt}\n"]
     o.append("## What this audit did not check\n")
     o.append("- Backlinks / referring domains\n")
     o.append("- Search Console (Google / Bing) data\n")
@@ -1693,6 +2309,101 @@ def to_markdown(r: dict) -> str:
         o.append(f"- TinyFish {kind}: `{what[:110]}`")
     o.append("- Plain HTTP GET (not TinyFish): raw HTML for JSON-LD, meta description and the JavaScript-dependence check.")
     return "\n".join(o) + "\n"
+
+def to_html(r: dict) -> str:
+    P = r.get("page", {})
+    S = r.get("scores", {})
+    findings = r.get("findings", [])
+    fix_first = r.get("fix_first", [])
+    cat_scores = r.get("category_scores", {})
+    visibility = r.get("visibility", {})
+    parity = r.get("parity", {})
+    bp = r.get("best_passage")
+    comps = r.get("competitors", [])
+    calls = r.get("calls", [])
+    query = r.get("query", "")
+    url = r.get("final_url") or r.get("url", "")
+    checked = r.get("checked_at", "")
+    rank = r.get("rank")
+    serp_size = r.get("serp_size", 0)
+    note_line = f"<p><em>{e(r.get('url_note'))}</em></p>" if r.get("url_note") else ""
+    def sec(title, body): return f"<section><h2>{e(title)}</h2>\n{body}\n</section>"
+    # Verdict
+    score_rows = ""
+    for area, s in (cat_scores or {}).items():
+        score_rows += f"<tr><td>{e(area)}</td><td>{e(s)}</td><td>{e(sum(1 for f in findings if f.get('area')==area))}</td></tr>\n"
+    verdict_body = (
+        f"<ul>"
+        f"<li><strong>AI readability:</strong> {e(S.get('ai_readability')) if S.get('ai_readability') is not None else 'n/a'}/100</li>"
+        f"<li><strong>Search visibility:</strong> {e('position '+str(rank) if rank else 'not returned in top '+str(serp_size))} (score {e(S.get('search_visibility')) if S.get('search_visibility') is not None else 'n/a'}/100)</li>"
+        f"<li><strong>Findings:</strong> {sum(1 for f in findings if f.get('sev')=='high')} high, {sum(1 for f in findings if f.get('sev')=='med')} medium, {sum(1 for f in findings if f.get('sev')=='low')} low</li>"
+        f"</ul>"
+        f"<table><thead><tr><th>Category</th><th>Score</th><th>Findings</th></tr></thead><tbody>{score_rows}</tbody></table>"
+    )
+    # Fix first
+    def fix_for_title(title):
+        f_map = {f.get('title'): f for f in findings}
+        f_obj = f_map.get(title)
+        if not f_obj:
+            return ""
+        fix_text = f_obj.get('fix','')
+        return (fix_text.split('. ')[0] + '.') if '.' in fix_text else fix_text.splitlines()[0]
+    ff_body = "<p>Nothing urgent.</p>" if not fix_first else "<ul>" + "".join(
+        f"<li><strong>{e(title)}</strong>: {e(fix_for_title(title))}</li>"
+        for title in fix_first
+    ) + "</ul>"
+    # Search view
+    target = visibility.get("target", {}); topic = visibility.get("topic", {}); brand = visibility.get("brand", {})
+    search_view = (
+        f"<h3>Target</h3><p>Query: <code>{e(query)}</code> | Rank: {e(target.get('rank')) if target.get('rank') is not None else 'not returned'}</p>"
+        f"<h3>Topic</h3><p>Rank: {e(topic.get('rank')) if topic.get('rank') is not None else 'not returned'}</p>"
+        f"<h3>Brand</h3><p>Rank: {e(brand.get('rank')) if brand.get('rank') is not None else 'not returned'}</p>"
+    )
+    # Best passage
+    bp_body = "<p>No best passage.</p>" if not bp else f"<blockquote>{e(bp.get('passage') or '')[:400]}</blockquote><p>Coverage: <strong>{int((bp.get('coverage',0) or 0)*100)}%</strong> | Offset: {e(bp.get('offset_words','n/a'))} | Length: {e(bp.get('length_words','n/a'))}</p>"
+    # Competitor table
+    comp_table = ""
+    if comps:
+        headers = ["Metric"] + [f"#{c.get('rank')}" for c in comps]
+        comp_table += "<table><thead><tr>" + "".join(f"<th>{e(h)}</th>" for h in headers) + "</tr></thead><tbody>"
+        for label, key, fmt in (
+            ("Query terms in title","t_title",lambda v: f"{round(v*100)}%" if v is not None else "n/a"),
+            ("Query terms in H1","t_h1",lambda v: f"{round(v*100)}%" if v is not None else "n/a"),
+            ("Query terms in first 120 words","t_first",lambda v: f"{round(v*100)}%" if v is not None else "n/a"),
+            ("Words","words",lambda v: str(v) if v is not None else "n/a"),
+            ("H2 sections","h2",lambda v: str(v) if v is not None else "n/a"),
+            ("Tables","tables",lambda v: str(v) if v is not None else "n/a"),
+            ("Lists","lists",lambda v: str(v) if v is not None else "n/a"),
+        ):
+            comp_table += "<tr>" + f"<td>{e(label)}</td>" + f"<td>{e(fmt(P.get(key,'n/a')))}</td>" + "".join(f"<td>{e(fmt(c.get(key,'n/a')))}</td>" for c in comps) + "</tr>"
+        comp_table += "</tbody></table>"
+    else:
+        comp_table = "<p>No competitor data.</p>"
+    # Findings with collapsible details
+    findings_body = ""
+    for f in findings:
+        details = f"<p><strong>Evidence:</strong> {e(f.get('evidence',''))}</p>"
+        if f.get('fix'):
+            details += f"<p><strong>Fix:</strong> {e(f.get('fix','').splitlines()[0])}</p>"
+        if f.get('snippet'):
+            details += f"<pre><code>{e(f.get('snippet',''))}</code></pre>"
+        if f.get('agent_prompt'):
+            details += f"<pre><code>{e(f.get('agent_prompt',''))}</code></pre>"
+        findings_body += f"<details><summary><strong>[{e(f.get('sev',''))}] {e(f.get('title',''))}</strong> — {e(f.get('area',''))} · affects {e(f.get('affects',''))}</summary>{details}</details>"
+    # Calls
+    calls_body = "<ul>" + "".join(f"<li><code>{e(k)}: {e(w)}</code></li>" for k,w in calls) + "</ul>" if calls else "<p>No calls.</p>"
+    # Not checked
+    not_checked_items = [
+        "Backlinks / referring domains","Search Console (Google / Bing) data",
+        "Core Web Vitals (LCP, INP, CLS)","Server logs or user-agent filtering beyond Fetch failures",
+        "WAF / bot-blocking rules beyond what Fetch reported",
+        "Full index coverage or ranking history across other search engines",
+    ]
+    not_checked = "<ul>" + "".join(f"<li>{e(i)}</li>" for i in not_checked_items) + "</ul>"
+    css_block = "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.6;max-width:900px;margin:2rem auto;padding:0 1rem;color:#1a1a1a;background:#fff;}h1,h2,h3{color:#0b1a2e;border-bottom:1px solid #e2e8f0;padding-bottom:.25rem;}table{border-collapse:collapse;width:100%;margin:1rem 0;}th,td{border:1px solid #cbd5e1;padding:.5rem .75rem;text-align:left;}th{background:#f1f5f9;}code,pre{background:#f8fafc;border:1px solid #e2e8f0;padding:.15rem .35rem;border-radius:.25rem;font-family:ui-monospace,SFMono-Regular,monospace;}pre{padding:.75rem;overflow-x:auto;}blockquote{margin:1rem 0;padding:.75rem 1rem;background:#f8fafc;border-left:4px solid #94a3b8;}details{margin:.75rem 0;border:1px solid #e2e8f0;border-radius:.4rem;padding:.75rem;background:#f8fafc;}summary{cursor:pointer;font-weight:600;}@media print{body{max-width:100%;margin:0;}details{border:1px solid #ccc;}}</style>"
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SEO Audit — {e(query or url)}</title>{css_block}</head><body><h1>AI-readability &amp; search audit</h1><p><strong>Page:</strong> <a href="{e(url)}">{e(url)}</a></p><p><strong>Checked live:</strong> {e(checked)}</p><p><strong>Query:</strong> <code>{e(query or '')}</code></p><p><strong>Page title:</strong> <code>{e(P.get('title',''))}</code></p><p><strong>Excerpt:</strong> <code>{e(P.get('excerpt','')[:200])}</code></p>{note_line}{sec('Verdict and category scores', verdict_body)}{sec('Fix first', ff_body)}{sec('Search view (target/topic/brand)', search_view)}
+
+{sec('Parity table', '<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>' + ''.join(f'<tr><td>{e(k)}</td><td>{e(str(parity.get(k,"n/a")))}</td></tr>' for k in parity) + '</tbody></table>')}{sec('Best passage', bp_body)}{sec('Competitor table', comp_table)}{sec('Full findings', findings_body)}{sec('How this audit was produced (calls log)', calls_body)}{sec('What this audit did not check', not_checked)}</body></html>"""
 
 
 BATCH_DELAY = 3.0
@@ -1759,6 +2470,7 @@ def main():
     ap.add_argument("--batch-delay", type=float, default=BATCH_DELAY, help="seconds between batch audits")
     ap.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
     ap.add_argument("--retries", type=int, default=RETRY_MAX_ATTEMPTS, help="Max retry attempts for API calls")
+    ap.add_argument("--html", action="store_true", help="also write a self-contained <out>.html report")
     a = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1897,6 +2609,12 @@ def main():
         f.write(redact(to_markdown(res)))
     with open(json_path_final, "w", encoding="utf-8") as f:
         f.write(json.dumps(redact_value(res), indent=2, default=str))
+    if a.html:
+        html_path = a.out + ".html"
+        html_path_final = safe_path(html_path)
+        with open(html_path_final, "w", encoding="utf-8") as f:
+            f.write(to_html(res))
+        print(redact(f"wrote {html_path_final}"))
     final_path_md = md_path_final
     final_path_json = json_path_final
     if res.get("status") == "not_found":

@@ -412,10 +412,12 @@ class Units(unittest.TestCase):
         # "How to use / Using widgets" (shared by 2) should be a gap.
         # "Navigation" and "Footer" should be dropped as boilerplate.
 
+        # Only topics covered by >=2 competitors survive; "Features" (3) should remain
         gaps = r.get("topic_gaps", [])
         self.assertTrue(len(gaps) >= 1)
         self.assertTrue(any("Feature" in g for g in gaps))
-        self.assertTrue(any("use" in g.lower() or "using" in g.lower() for g in gaps))
+        # "How to use" and "Using widgets" are covered by only 1 competitor each, so they should not appear
+        self.assertFalse(any("use" in g.lower() or "using" in g.lower() for g in gaps))
         self.assertFalse(any("Pricing" in g for g in gaps))
         self.assertFalse(any("Navigation" in g for g in gaps))
         self.assertFalse(any("Footer" in g for g in gaps))
@@ -639,7 +641,8 @@ class Units(unittest.TestCase):
 
         self.assertIn("Much of the text only exists after JavaScript runs", f_map)
         f_js = f_map["Much of the text only exists after JavaScript runs"]
-        self.assertEqual(f_js["confidence"], "verified")
+        # Without raw HTML verification, confidence should be likely (not verified)
+        self.assertEqual(f_js["confidence"], "likely")
         self.assertIn("curl", f_js["verify"])
 
         self.assertIn("No structured data (JSON-LD)", f_map)
@@ -760,6 +763,29 @@ class Units(unittest.TestCase):
         self.assertNotIn("_Confidence:", md_mock)
         self.assertNotIn("Verify:", md_mock)
 
+    def test_html_escapes_untrusted_text(self):
+        malicious_title = '<script>alert(1)</script>'
+        malicious_snippet = '"><img src=x onerror=alert(1)>'
+        r = {
+            "status": "ok", "url": "https://example.com/", "final_url": "https://example.com/",
+            "url_note": None, "checked_at": "now", "query": "test", "query_source": "given",
+            "rank": 1, "serp_entry": None, "serp_size": 3,
+            "scores": {"ai_readability": 90, "search_visibility": 80},
+            "page": {"words": 200, "title": malicious_title, "h1": malicious_title, "h2": 0, "tables": 0, "lists": 0,
+                     "description": "", "description_source": "none", "canonical": "https://example.com/",
+                     "robots": "", "images": 0, "images_missing_alt": 0, "links": 1, "excerpt": malicious_snippet,
+                     "jsonld_types": None, "raw_status": 200, "published": None, "author": None},
+            "site": {"robots_txt": False, "llms_txt": False, "in_sitemap": True, "blocked_bots": []},
+            "competitors": [], "competitor_errors": [], "findings": [], "fix_first": [], "calls": [],
+            "category_scores": {"access": 100, "content": 100, "metadata": 100, "visibility": 100},
+            "topic_gaps": [], "parity": {}, "best_passage": None, "terms": ["test"]
+        }
+        html_text = A.to_html(r)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', html_text)
+        self.assertIn('&quot;&gt;&lt;img src=x onerror=alert(1)&gt;', html_text)
+        # Should not contain raw script tag
+        self.assertNotIn('<img src=x onerror=alert(1)>', html_text)
+        self.assertNotIn('<script>alert(1)</script>', html_text)
 
 if __name__ == "__main__":
     unittest.main()
