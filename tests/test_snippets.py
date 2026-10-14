@@ -26,7 +26,10 @@ class SnippetTests(unittest.TestCase):
 
     def test_og_twitter_omits_empty_tags(self):
         snippet = A.build_snippet_og_twitter("", "", {}, "https://example.com/", "")
-        self.assertIn("omit tags with no value", snippet)
+        # With empty meta, snippet lists only missing tags (not a full proposal)
+        self.assertIn("og:title", snippet)
+        self.assertIn("twitter:card", snippet)
+        self.assertNotIn("Assembled", snippet)
 
     def test_jsonld_article_with_date_author(self):
         snippet = A.build_snippet_jsonld(
@@ -56,9 +59,11 @@ class SnippetTests(unittest.TestCase):
         self.assertIn("optional", snippet)
 
     def test_llms_snippet_from_links(self):
+        # With fewer than 3 clean links, emit only header and summary (per requirement)
         snippet = A.build_snippet_llms("https://example.com", [{"url":"https://example.com/a","text":"About"}])
-        self.assertIn("About", snippet)
         self.assertIn("optional", snippet)
+        # Should emit header and summary only when links are fewer than 3
+        self.assertIn("header and summary", snippet)
 
     def test_backtick_safety_fence_expands(self):
         # Snippet containing triple backticks should not break out

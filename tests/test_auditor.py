@@ -440,7 +440,7 @@ class Units(unittest.TestCase):
         titles = " | ".join(f["title"] for f in r["findings"])
         for expect in ("robots.txt blocks search crawlers", "only exists after JavaScript", "No structured data",
                        "Canonical points to a different URL", "images have no alt", "Query terms missing from your title",
-                       "Returned by a domain-restricted TinyFish Search", "Page not found in sitemap", "No llms.txt", "Article exposes no",
+                       "Not in the top 30 results for this query; a domain-restricted search did return the page", "Page not found in sitemap", "No llms.txt", "Article exposes no",
                        "Heading levels skip"):
             self.assertIn(expect, titles)
         self.assertEqual(r["rank"], None)
