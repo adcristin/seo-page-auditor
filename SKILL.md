@@ -15,14 +15,14 @@ python ai_seo_auditor.py <url> -q "target query" -o report
 python ai_seo_auditor.py --batch urls.csv --batch-delay 3 --country IN
 python ai_seo_auditor.py <url> --no-raw -o report_no_raw
 python ai_seo_auditor.py <url> --html --debug-parity -o report
-python -m unittest        # offline tests only; never call live API
+python -m unittest        # offline tests in tests/ only; never call live API
 ```
 
 Flags from `ai_seo_auditor.py`: `-q/--query`, `-o/--out` (default `report`), `--country`, `--language`, `--no-raw`, `--batch FILE`, `--batch-delay`, `--timeout` (default 30), `--retries` (default `RETRY_MAX_ATTEMPTS`), `--html`, `--debug-parity`. Positional query words allowed without `-q`.
 
 ## Architecture notes (verified from source)
 
-- Single-file CLI (`ai_seo_auditor.py`) + offline unittest suite. No extra packages without asking.
+- Single-file CLI (`ai_seo_auditor.py`) + offline unittest suite under `tests/` (11 modules). No extra packages without asking.
 - `audit(url, query, tf, ...)` is the single entry point; returns dict with `scores`, `findings`, `competitors`, `topic_gaps`, `calls`.
 - `TinyFish` wrapper logs calls (`calls` list) for provenance.
 - `normalize_target()` validates public URLs (rejects localhost/private IPs, embedded credentials, secret query params, unsupported schemes).

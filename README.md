@@ -71,7 +71,7 @@ Backlinks / referring domains; Search Console (Google / Bing) data; Core Web Vit
 
 ## Development
 
-Run tests with synthetic data:
+Run tests with synthetic data (from the repo root; the suite lives in `tests/` and is auto-discovered):
 
 ```bash
 python -m unittest
